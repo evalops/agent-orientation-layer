@@ -27,9 +27,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SHARD_MANIFEST_FORMAT_VERSION: u32 = 1;
 const SHARD_MANIFEST_VERSION: u32 = SHARD_MANIFEST_FORMAT_VERSION;
-const SHARD_MANIFEST_SIDECAR_VERSION: u32 = 3;
+const SHARD_MANIFEST_SIDECAR_VERSION: u32 = 4;
 const SHARD_MANIFEST_PREFILTER_VERSION: u32 = 3;
-const SHARD_MANIFEST_ROUTE_VERSION: u32 = 13;
+const SHARD_MANIFEST_ROUTE_VERSION: u32 = 14;
 const SHARD_MANIFEST_FILE: &str = "manifest.json";
 const SHARD_MANIFEST_SIDECAR_FILE: &str = "manifest.bin";
 const SHARD_MANIFEST_PREFILTER_FILE: &str = "manifest.prefilter.bin";
@@ -96,8 +96,10 @@ struct ShardManifestRoute {
     shards: Vec<ShardRouteEntry>,
     exact_terms: Vec<ShardRouteTerm>,
     trigram_terms: Vec<ShardRouteTerm>,
+    symbol_substring_terms: Vec<ShardRouteTerm>,
     omitted_hashes: Vec<u32>,
     omitted_trigram_hashes: Vec<u32>,
+    omitted_symbol_substring_hashes: Vec<u32>,
     shard_ids: Vec<u8>,
 }
 
@@ -164,6 +166,7 @@ struct ShardRouteRequirements {
     exact_hashes: Vec<u32>,
     trigram_hashes: Vec<u32>,
     substring_grams: Vec<String>,
+    symbol_substring_hashes: Vec<u32>,
     symbol_substring_grams: Vec<String>,
 }
 
@@ -199,6 +202,8 @@ pub struct ShardQuerySketch {
     pub trigram_bits: Vec<u64>,
     #[serde(default)]
     pub substring_bits: Vec<u64>,
+    #[serde(default)]
+    pub symbol_substring_hashes: Vec<u32>,
     #[serde(default)]
     pub symbol_substring_bits: Vec<u64>,
     #[serde(default)]
@@ -2398,6 +2403,7 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
     );
     let mut trigram_bits = vec![0; SHARD_TRIGRAM_SKETCH_WORDS];
     let mut substring_bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
+    let mut symbol_substring_hashes = Vec::new();
     let mut symbol_substring_bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
     let mut symbol_kind_bits = vec![0; SHARD_KIND_SKETCH_WORDS];
     let mut filter_bits = vec![0; SHARD_FILTER_SKETCH_WORDS];
@@ -2418,11 +2424,17 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
         push_content_substring_grams(&file.content, &mut substring_bits);
         push_normalized_content_identifier_substring_grams(&file.content, &mut substring_bits);
         for symbol in &file.symbols {
-            push_symbol_substring_grams(symbol, &mut symbol_substring_bits);
+            push_symbol_substring_grams(
+                symbol,
+                &mut symbol_substring_bits,
+                &mut symbol_substring_hashes,
+            );
         }
     }
     exact_hashes.sort_unstable();
     exact_hashes.dedup();
+    symbol_substring_hashes.sort_unstable();
+    symbol_substring_hashes.dedup();
     for key in index.trigram_postings.keys() {
         sketch_insert(&mut trigram_bits, key);
     }
@@ -2446,6 +2458,7 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
         exact_bits: Vec::new(),
         trigram_bits,
         substring_bits,
+        symbol_substring_hashes,
         symbol_substring_bits,
         symbol_kind_bits,
         filter_bits,
@@ -2619,7 +2632,11 @@ fn push_normalized_identifier_substring_grams(identifier: &mut String, substring
     identifier.clear();
 }
 
-fn push_symbol_substring_grams(symbol: &IndexedSymbol, symbol_substring_bits: &mut [u64]) {
+fn push_symbol_substring_grams(
+    symbol: &IndexedSymbol,
+    symbol_substring_bits: &mut [u64],
+    symbol_substring_hashes: &mut Vec<u32>,
+) {
     let normalized = if symbol.normalized.is_empty() {
         normalize_token(&symbol.name)
     } else {
@@ -2628,6 +2645,7 @@ fn push_symbol_substring_grams(symbol: &IndexedSymbol, symbol_substring_bits: &m
     if normalized.chars().count() >= SHARD_ROUTE_SUBSTRING_GRAM_CHARS {
         for gram in shard_query_substring_grams(&normalized) {
             sketch_insert(symbol_substring_bits, &gram);
+            symbol_substring_hashes.push(sketch_fingerprint(&gram));
         }
     }
 }
@@ -3195,6 +3213,36 @@ fn shard_route_candidate_ids(
         );
     }
     if !requirements.symbol_substring_grams.is_empty() {
+        let mut saw_symbol_omitted = false;
+        for hash in &requirements.symbol_substring_hashes {
+            let postings = match shard_route_postings(route, &route.symbol_substring_terms, *hash) {
+                Ok(Some(postings)) => postings,
+                Ok(None)
+                    if route
+                        .omitted_symbol_substring_hashes
+                        .binary_search(hash)
+                        .is_ok() =>
+                {
+                    saw_symbol_omitted = true;
+                    continue;
+                }
+                Ok(None) => return ShardRouteLookup::MissingHash,
+                Err(()) => return ShardRouteLookup::Corrupt,
+            };
+            candidate_ids = Some(match candidate_ids {
+                Some(existing) => intersect_u16_sorted(&existing, &postings),
+                None => postings,
+            });
+            if candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+                return ShardRouteLookup::Candidates(Vec::new());
+            }
+        }
+        if !saw_symbol_omitted {
+            return match candidate_ids {
+                Some(candidate_ids) => ShardRouteLookup::Candidates(candidate_ids),
+                None => ShardRouteLookup::MissingHash,
+            };
+        }
         let ids = candidate_ids.take().unwrap_or_else(|| {
             (0..route.shards.len())
                 .filter_map(|id| u16::try_from(id).ok())
@@ -3295,6 +3343,10 @@ fn shard_route_requirements(shard_query: &str, filters: &SearchFilters) -> Shard
     substring_grams.sort();
     substring_grams.dedup();
     let symbol_substring_grams = route_symbol_filter_substring_grams(filters);
+    let symbol_substring_hashes = symbol_substring_grams
+        .iter()
+        .map(|gram| sketch_fingerprint(gram))
+        .collect();
     trigram_hashes.sort_unstable();
     trigram_hashes.dedup();
     ShardRouteRequirements {
@@ -3302,6 +3354,7 @@ fn shard_route_requirements(shard_query: &str, filters: &SearchFilters) -> Shard
         exact_hashes,
         trigram_hashes,
         substring_grams,
+        symbol_substring_hashes,
         symbol_substring_grams,
     }
 }
@@ -3754,6 +3807,7 @@ fn save_manifest_route(index_dir: &Path, manifest: &ShardManifest) -> Result<()>
     let manifest_path = index_dir.join(SHARD_MANIFEST_FILE);
     let mut postings = HashMap::<u32, Vec<u16>>::new();
     let mut trigram_postings = HashMap::<u32, Vec<u16>>::new();
+    let mut symbol_substring_postings = HashMap::<u32, Vec<u16>>::new();
     let shards = manifest
         .shards
         .iter()
@@ -3765,6 +3819,12 @@ fn save_manifest_route(index_dir: &Path, manifest: &ShardManifest) -> Result<()>
                 }
                 for hash in &sketch.trigram_hashes {
                     trigram_postings
+                        .entry(*hash)
+                        .or_default()
+                        .push(shard_id as u16);
+                }
+                for hash in &sketch.symbol_substring_hashes {
+                    symbol_substring_postings
                         .entry(*hash)
                         .or_default()
                         .push(shard_id as u16);
@@ -3792,14 +3852,28 @@ fn save_manifest_route(index_dir: &Path, manifest: &ShardManifest) -> Result<()>
         &mut shard_ids,
     );
 
+    let mut symbol_substring_terms_input =
+        symbol_substring_postings.into_iter().collect::<Vec<_>>();
+    symbol_substring_terms_input.sort_unstable_by_key(|(hash, _)| *hash);
+    let mut symbol_substring_terms = Vec::with_capacity(symbol_substring_terms_input.len());
+    let mut omitted_symbol_substring_hashes = Vec::new();
+    encode_route_terms(
+        symbol_substring_terms_input,
+        &mut symbol_substring_terms,
+        &mut omitted_symbol_substring_hashes,
+        &mut shard_ids,
+    );
+
     let route = ShardManifestRoute {
         version: SHARD_MANIFEST_ROUTE_VERSION,
         json_fingerprint: manifest_file_fingerprint(&manifest_path)?,
         shards,
         exact_terms,
         trigram_terms,
+        symbol_substring_terms,
         omitted_hashes,
         omitted_trigram_hashes,
+        omitted_symbol_substring_hashes,
         shard_ids,
     };
     let bytes = bincode::serialize(&route)?;
@@ -4161,6 +4235,7 @@ mod tests {
             exact_hashes: hashes.to_vec(),
             trigram_hashes: Vec::new(),
             substring_grams: Vec::new(),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_grams: Vec::new(),
         }
     }
@@ -4171,6 +4246,7 @@ mod tests {
             exact_hashes: Vec::new(),
             trigram_hashes: hashes.to_vec(),
             substring_grams: Vec::new(),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_grams: Vec::new(),
         }
     }
@@ -4181,6 +4257,7 @@ mod tests {
             exact_hashes: Vec::new(),
             trigram_hashes: Vec::new(),
             substring_grams: shard_query_substring_grams(value),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_grams: Vec::new(),
         }
     }
@@ -4203,6 +4280,16 @@ mod tests {
             sketch_insert(&mut bits, &gram);
         }
         bits
+    }
+
+    fn symbol_substring_hashes_for(value: &str) -> Vec<u32> {
+        let mut hashes = shard_query_substring_grams(&normalize_token(value))
+            .into_iter()
+            .map(|gram| sketch_fingerprint(&gram))
+            .collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes.dedup();
+        hashes
     }
 
     #[test]
@@ -4270,6 +4357,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: substring_bits_for("routeprobe"),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: vec![1],
             filter_bits: vec![2],
@@ -4402,6 +4490,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: rust_filter_bits,
@@ -4415,6 +4504,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: python_filter_bits,
@@ -4554,6 +4644,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_hashes: Vec::new(),
                     symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
@@ -4609,6 +4700,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_hashes: Vec::new(),
                     symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
@@ -4713,6 +4805,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_hashes: Vec::new(),
                     symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
@@ -4799,6 +4892,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_hashes: Vec::new(),
                     symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
@@ -4853,6 +4947,7 @@ mod tests {
                 exact_bits: Vec::new(),
                 trigram_bits: Vec::new(),
                 substring_bits: Vec::new(),
+                symbol_substring_hashes: Vec::new(),
                 symbol_substring_bits: Vec::new(),
                 symbol_kind_bits: Vec::new(),
                 filter_bits: Vec::new(),
@@ -4900,6 +4995,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
@@ -4910,6 +5006,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
@@ -4942,6 +5039,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: substring_bits_for("prefix_trigramprobesuffix"),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
@@ -4952,6 +5050,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: substring_bits_for("trigram and probe appear apart"),
+            symbol_substring_hashes: Vec::new(),
             symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
@@ -4993,6 +5092,7 @@ mod tests {
                 exact_bits: Vec::new(),
                 trigram_bits: Vec::new(),
                 substring_bits: Vec::new(),
+                symbol_substring_hashes: Vec::new(),
                 symbol_substring_bits: Vec::new(),
                 symbol_kind_bits: Vec::new(),
                 filter_bits: Vec::new(),
@@ -5005,8 +5105,18 @@ mod tests {
             .as_mut()
             .unwrap()
             .symbol_substring_bits = symbol_substring_bits_for("SessionManager");
+        manifest.shards[0]
+            .sketch
+            .as_mut()
+            .unwrap()
+            .symbol_substring_hashes = symbol_substring_hashes_for("SessionManager");
         manifest.shards[1].sketch.as_mut().unwrap().substring_bits =
             substring_bits_for("session manager token");
+        manifest.shards[1]
+            .sketch
+            .as_mut()
+            .unwrap()
+            .symbol_substring_bits = symbol_substring_bits_for("SessionManager");
         save_manifest(dir.path(), &manifest).unwrap();
 
         let stats = shard_query_route_stats(
@@ -5059,7 +5169,9 @@ mod tests {
             }],
             omitted_hashes: Vec::new(),
             trigram_terms: Vec::new(),
+            symbol_substring_terms: Vec::new(),
             omitted_trigram_hashes: Vec::new(),
+            omitted_symbol_substring_hashes: Vec::new(),
             shard_ids: vec![0x80],
         };
 
@@ -5098,7 +5210,9 @@ mod tests {
             }],
             omitted_hashes: Vec::new(),
             trigram_terms: Vec::new(),
+            symbol_substring_terms: Vec::new(),
             omitted_trigram_hashes: Vec::new(),
+            omitted_symbol_substring_hashes: Vec::new(),
             shard_ids,
         };
 
