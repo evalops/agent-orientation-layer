@@ -6297,6 +6297,60 @@ fn cli_reports_search_benchmarks() {
 }
 
 #[test]
+fn cli_reports_index_build_and_refresh_benchmarks() {
+    let repo = sample_repo();
+    let index_path = repo.path().join(".orient/index-bench");
+
+    let mut build = Command::cargo_bin("orient").unwrap();
+    build
+        .args([
+            "bench-index",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index",
+            index_path.to_str().unwrap(),
+            "--mode",
+            "build",
+            "--runs",
+            "2",
+            "--warmup",
+            "0",
+            "--fail-p95-ms",
+            "1000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"mode\":\"build\""))
+        .stdout(predicate::str::contains("\"sample_count\":2"))
+        .stdout(predicate::str::contains("\"index_to_source_ratio\""))
+        .stdout(predicate::str::contains("\"elapsed_ms\""))
+        .stdout(predicate::str::contains("\"index_bytes\""));
+
+    let mut refresh = Command::cargo_bin("orient").unwrap();
+    refresh
+        .args([
+            "bench-index",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index",
+            index_path.to_str().unwrap(),
+            "--mode",
+            "refresh",
+            "--runs",
+            "2",
+            "--warmup",
+            "1",
+            "--fail-p99-ms",
+            "1000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"mode\":\"refresh\""))
+        .stdout(predicate::str::contains("\"reused_files\""))
+        .stdout(predicate::str::contains("\"refreshed_files\""));
+}
+
+#[test]
 fn cli_benchmarks_accept_query_flags() {
     let repo = sample_repo();
 

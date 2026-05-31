@@ -8,6 +8,9 @@ Orient has four benchmark layers:
 - `tools/ci/orient_agent_query_perf.sh` is the local agent-workload benchmark.
   It discovers a local workspace, builds shards with worktree-family limiting,
   and runs a mixed query set that looks like what coding agents ask for.
+- `orient bench-index` measures persisted index build or refresh latency plus
+  footprint and reuse stats, so large-repo indexing cost is visible separately
+  from query latency.
 - `orient bench-daemon` is the shared-daemon concurrency benchmark. It sends
   simultaneous JSON-lines `search_auto` requests to one daemon so a local
   multi-agent setup can check queueing and tail latency.
@@ -59,6 +62,22 @@ tools/ci/orient_daemon_cwd_perf.sh
 Set `ORIENT_DAEMON_CWD_REBUILD_SHARDS=1` to rebuild shards, or leave it unset
 to reuse an existing shard directory when possible. The default p95 gate is
 300ms and can be changed with `ORIENT_DAEMON_CWD_P95_MS`.
+
+Measure persisted index build or refresh cost with:
+
+```bash
+orient bench-index \
+  --repo /path/to/repo \
+  --index /tmp/orient.index \
+  --mode refresh \
+  --runs 5 \
+  --warmup 1 \
+  --fail-p95-ms 10000
+```
+
+Use `--mode build` to delete and rebuild the index for each measured sample.
+The report includes elapsed samples, index bytes, source bytes,
+`index_to_source_ratio`, and the latest refresh reuse counts.
 
 Run the multi-agent contention benchmark with:
 

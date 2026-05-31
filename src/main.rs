@@ -138,6 +138,24 @@ enum Commands {
         #[arg(long)]
         index: PathBuf,
     },
+    BenchIndex {
+        #[arg(long = "format", default_value = "json", value_parser = ["json"])]
+        format: String,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long, default_value_t = IndexBenchMode::Refresh)]
+        mode: IndexBenchMode,
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        #[arg(long)]
+        fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_ms: Option<f64>,
+    },
     IndexShards {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
         format: String,
@@ -1308,6 +1326,21 @@ enum BenchSearchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum IndexBenchMode {
+    Build,
+    Refresh,
+}
+
+impl std::fmt::Display for IndexBenchMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexBenchMode::Build => formatter.write_str("build"),
+            IndexBenchMode::Refresh => formatter.write_str("refresh"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ReadScopeArg {
     Exact,
     Symbol,
@@ -1855,6 +1888,42 @@ struct QueryBench {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_request_count: Option<usize>,
     samples_ms: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexBenchReport {
+    mode: String,
+    runs: usize,
+    warmup: usize,
+    repo: PathBuf,
+    index: PathBuf,
+    summary: IndexBenchSummary,
+    samples: Vec<IndexBenchSample>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IndexBenchSummary {
+    sample_count: usize,
+    min_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+    files: usize,
+    source_bytes: u64,
+    index_bytes: u64,
+    index_to_source_ratio: f64,
+    reused_files: usize,
+    renamed_files: usize,
+    refreshed_files: usize,
+    deleted_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexBenchSample {
+    elapsed_ms: f64,
+    index_bytes: u64,
+    stats: RefreshStats,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3678,6 +3747,31 @@ fn run() -> Result<()> {
                 "{}",
                 serde_json::to_string(&index.freshness_at(index_path)?)?
             );
+        }
+        Commands::BenchIndex {
+            format: _format,
+            repo,
+            index,
+            mode,
+            runs,
+            warmup,
+            fail_p95_ms,
+            fail_p99_ms,
+        } => {
+            let report = bench_index(IndexBenchConfig {
+                repo,
+                index,
+                mode,
+                runs,
+                warmup,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            if let Some(threshold) = fail_p95_ms {
+                fail_index_bench_p95(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_p99_ms {
+                fail_index_bench_p99(&report, threshold)?;
+            }
         }
         Commands::IndexShards {
             format: _format,
@@ -7511,6 +7605,97 @@ fn refresh_or_build_index(repo: PathBuf, index: PathBuf) -> Result<RefreshStats>
     Ok(outcome.index.refresh_stats(&outcome))
 }
 
+struct IndexBenchConfig {
+    repo: PathBuf,
+    index: PathBuf,
+    mode: IndexBenchMode,
+    runs: usize,
+    warmup: usize,
+}
+
+fn bench_index(config: IndexBenchConfig) -> Result<IndexBenchReport> {
+    let runs = config.runs.max(1);
+    if config.mode == IndexBenchMode::Refresh && !config.index.exists() {
+        refresh_or_build_index(config.repo.clone(), config.index.clone())?;
+    }
+    for _ in 0..config.warmup {
+        run_index_bench_once(config.mode, &config.repo, &config.index)?;
+    }
+
+    let mut samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        samples.push(run_index_bench_once(
+            config.mode,
+            &config.repo,
+            &config.index,
+        )?);
+    }
+    let summary = summarize_index_bench(&samples);
+    Ok(IndexBenchReport {
+        mode: config.mode.to_string(),
+        runs,
+        warmup: config.warmup,
+        repo: config.repo,
+        index: config.index,
+        summary,
+        samples,
+    })
+}
+
+fn run_index_bench_once(
+    mode: IndexBenchMode,
+    repo: &Path,
+    index: &Path,
+) -> Result<IndexBenchSample> {
+    if mode == IndexBenchMode::Build && index.exists() {
+        fs::remove_file(index)?;
+    }
+    let started = Instant::now();
+    let stats = refresh_or_build_index(repo.to_path_buf(), index.to_path_buf())?;
+    let elapsed_ms = round_ms(started.elapsed().as_secs_f64() * 1_000.0);
+    let index_bytes = fs::metadata(index)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    Ok(IndexBenchSample {
+        elapsed_ms,
+        index_bytes,
+        stats,
+    })
+}
+
+fn summarize_index_bench(samples: &[IndexBenchSample]) -> IndexBenchSummary {
+    let mut samples_ms = samples
+        .iter()
+        .map(|sample| sample.elapsed_ms)
+        .collect::<Vec<_>>();
+    samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let latest = samples.last();
+    let source_bytes = latest.map(|sample| sample.stats.source_bytes).unwrap_or(0);
+    let index_bytes = latest.map(|sample| sample.index_bytes).unwrap_or(0);
+    IndexBenchSummary {
+        sample_count: samples.len(),
+        min_ms: round_ms(*samples_ms.first().unwrap_or(&0.0)),
+        p50_ms: round_ms(percentile(&samples_ms, 0.50)),
+        p95_ms: round_ms(percentile(&samples_ms, 0.95)),
+        p99_ms: round_ms(percentile(&samples_ms, 0.99)),
+        max_ms: round_ms(*samples_ms.last().unwrap_or(&0.0)),
+        files: latest.map(|sample| sample.stats.files).unwrap_or(0),
+        source_bytes,
+        index_bytes,
+        index_to_source_ratio: if source_bytes == 0 {
+            0.0
+        } else {
+            round_ratio(index_bytes as f64 / source_bytes as f64)
+        },
+        reused_files: latest.map(|sample| sample.stats.reused_files).unwrap_or(0),
+        renamed_files: latest.map(|sample| sample.stats.renamed_files).unwrap_or(0),
+        refreshed_files: latest
+            .map(|sample| sample.stats.refreshed_files)
+            .unwrap_or(0),
+        deleted_files: latest.map(|sample| sample.stats.deleted_files).unwrap_or(0),
+    }
+}
+
 fn load_index_for_search(index_path: PathBuf, refresh_if_stale: bool) -> Result<FastIndex> {
     let index = FastIndex::load(&index_path)?;
     if !refresh_if_stale || !index.freshness()?.stale {
@@ -9548,6 +9733,30 @@ fn fail_bench_refresh_overhead(report: &BenchReport, threshold: f64) -> Result<(
         bail!(
             "refresh overhead p95 {:.3}ms exceeded threshold {:.3}ms",
             refresh_overhead,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_index_bench_p95(report: &IndexBenchReport, threshold: f64) -> Result<()> {
+    if report.summary.p95_ms > threshold {
+        bail!(
+            "index {} p95 {:.3}ms exceeded threshold {:.3}ms",
+            report.mode,
+            report.summary.p95_ms,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_index_bench_p99(report: &IndexBenchReport, threshold: f64) -> Result<()> {
+    if report.summary.p99_ms > threshold {
+        bail!(
+            "index {} p99 {:.3}ms exceeded threshold {:.3}ms",
+            report.mode,
+            report.summary.p99_ms,
             threshold
         );
     }

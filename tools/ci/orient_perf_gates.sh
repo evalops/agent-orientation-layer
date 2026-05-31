@@ -44,6 +44,14 @@ target/release/orient bench-search \
   "file:Cargo.toml"
 
 target/release/orient index --repo . --output "${index_path}"
+target/release/orient bench-index \
+  --repo . \
+  --index "${index_path}" \
+  --mode refresh \
+  --runs 3 \
+  --warmup 1 \
+  --fail-p95-ms 10000 \
+  --fail-p99-ms 10000
 target/release/orient bench-search \
   --repo . \
   --index "${index_path}" \
