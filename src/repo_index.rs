@@ -7400,8 +7400,8 @@ pub fn result_value_read_batch_request(
     tool: &str,
     base_arguments: serde_json::Map<String, serde_json::Value>,
 ) -> Option<ResultToolRequest> {
-    let ranges = result
-        .as_array()?
+    let results = search_result_values(result)?;
+    let ranges = results
         .iter()
         .filter_map(|item| item.get("read_range"))
         .filter_map(|value| serde_json::from_value::<ResultReadRange>(value.clone()).ok())
@@ -7420,15 +7420,23 @@ pub(crate) fn grouped_duplicate_count_from_results(results: &[SearchResult]) -> 
 }
 
 pub(crate) fn grouped_duplicate_count_from_value(result: &serde_json::Value) -> usize {
-    result
-        .as_array()
-        .into_iter()
-        .flatten()
+    search_result_values(result)
+        .unwrap_or(&[])
+        .iter()
         .filter_map(|item| item.get("duplicate_group"))
         .filter_map(|group| group.get("duplicate_count"))
         .filter_map(serde_json::Value::as_u64)
         .filter_map(|count| usize::try_from(count).ok())
         .sum()
+}
+
+fn search_result_values(result: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    result.as_array().map(Vec::as_slice).or_else(|| {
+        result
+            .get("results")
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+    })
 }
 
 pub fn attach_result_related_requests(

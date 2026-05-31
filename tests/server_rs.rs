@@ -8058,6 +8058,65 @@ fn runtime_search_auto_reports_stale_index_refresh_request_on_empty_results() {
 }
 
 #[test]
+fn runtime_search_auto_retry_if_empty_refreshes_stale_index_once() {
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        &repo.path().join("src/auth.rs"),
+        "pub struct SessionManager;\npub fn issue_token() {}\n",
+    );
+    let index_path = repo.path().join(".orient/index");
+    FastIndex::build(repo.path())
+        .unwrap()
+        .save(&index_path)
+        .unwrap();
+    write(
+        &repo.path().join("src/new_session.rs"),
+        "pub fn new_session_token() {}\n",
+    );
+
+    let runtime = ToolRuntime::default();
+    runtime.warm_index(index_path.clone()).unwrap();
+    let response = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("stale-auto-index-retry"),
+        tool: "search_auto".to_string(),
+        arguments: serde_json::json!({
+            "query": "new_session_token",
+            "limit": 3,
+            "require_all": true,
+            "retry_if_empty": true
+        }),
+    });
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["surface"], serde_json::json!("indexed"));
+    assert_eq!(result["results"], serde_json::json!([]));
+    assert_eq!(result["freshness"]["stale"], serde_json::json!(true));
+    assert_eq!(result["refresh_request"], serde_json::Value::Null);
+    assert_eq!(
+        result["primary_retry_result"]["request"]["arguments"]["refresh_if_stale"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        result["primary_retry_result"]["summary"]["status"],
+        serde_json::json!("matched")
+    );
+    assert_eq!(
+        result["primary_retry_result"]["summary"]["result_count"],
+        serde_json::json!(1)
+    );
+    assert!(
+        serde_json::to_string(&result["primary_retry_result"])
+            .unwrap()
+            .contains("src/new_session.rs"),
+        "{result}"
+    );
+    assert_eq!(
+        result["next_action"]["source"],
+        serde_json::json!("next_read_batch_request")
+    );
+}
+
+#[test]
 fn runtime_coalesces_parallel_cold_index_requests() {
     let repo = tempfile::tempdir().unwrap();
     write(
@@ -8945,6 +9004,62 @@ fn runtime_search_auto_refreshes_only_query_selected_shard_when_repo_filter_is_i
     assert!(
         !current_search.contains("current-app/src/new_current.rs"),
         "{current_search}"
+    );
+}
+
+#[test]
+fn runtime_search_auto_retry_if_empty_refreshes_stale_cwd_shard_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let current_repo = workspace.path().join("current-app");
+    fs::create_dir_all(current_repo.join(".git")).unwrap();
+    write(
+        &current_repo.join("src/lib.rs"),
+        "pub fn baseline_current_token() {}\n",
+    );
+    let shard_dir = workspace.path().join("shards");
+    build_shards(&[PathBuf::from(&current_repo)], &shard_dir).unwrap();
+
+    write(
+        &current_repo.join("src/new_current.rs"),
+        "pub fn current_after_retry_refresh_token() {}\n",
+    );
+
+    let runtime = ToolRuntime::default();
+    runtime.warm_shards(shard_dir.clone()).unwrap();
+
+    let response = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("fresh-current-retry"),
+        tool: "search_auto".to_string(),
+        arguments: serde_json::json!({
+            "cwd": current_repo.join("src"),
+            "query": "current_after_retry_refresh_token",
+            "limit": 5,
+            "retry_if_empty": true
+        }),
+    });
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["surface"], serde_json::json!("shards"));
+    assert_eq!(result["results"], serde_json::json!([]));
+    assert_eq!(result["freshness"]["stale"], serde_json::json!(true));
+    assert_eq!(result["refresh_request"], serde_json::Value::Null);
+    assert_eq!(
+        result["primary_retry_result"]["request"]["arguments"]["refresh_if_stale"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        result["primary_retry_result"]["summary"]["status"],
+        serde_json::json!("matched")
+    );
+    assert!(
+        serde_json::to_string(&result["primary_retry_result"])
+            .unwrap()
+            .contains("current-app/src/new_current.rs"),
+        "{result}"
+    );
+    assert_eq!(
+        result["next_action"]["source"],
+        serde_json::json!("next_read_batch_request")
     );
 }
 

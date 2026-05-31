@@ -86,8 +86,10 @@ shared multi-repo daemons focused on the current task. With the same scope,
 `refresh_if_stale:true` refreshes only that repo's shard. Empty or diagnostic
 `search_auto` responses include a compact `freshness` object when the scoped
 index is stale, plus a top-level ready-to-run `refresh_request` that refreshes
-and repeats the search. Shard freshness includes branch/origin metadata drift,
-so switching branches without touching files is still detected.
+and repeats the search. With `retry_if_empty:true`, Orient runs that refresh
+request once and returns the refreshed response as `primary_retry_result`.
+Shard freshness includes branch/origin metadata drift, so switching branches
+without touching files is still detected.
 `client-jsonl` and `daemon-status` also honor `ORIENT_SOCKET` and `ORIENT_ADDR`
 when no transport flag is passed, with explicit flags taking precedence.
 When a JSON-lines or MCP client calls `daemon_status` with `cwd`, the returned

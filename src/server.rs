@@ -2255,7 +2255,7 @@ Keep cache paths local to the machine running the agents; do not copy machine-sp
 Orient shares code-search artifacts only and has no telemetry.\n\
 For many local repos, bootstrap it with `orient ensure-shards --discover-root /path/to/workspaces --output-dir {index_dir} --family-limit 2` and `{multi_repo_serve}`.\n\
 For one repo, bootstrap it with `orient ensure-index --repo {repo} --index {index}` and `{single_repo_serve}`.\n\
-At the start of a task, call `daemon_status` or `agent_guide`, then use `search_auto` with `retry_if_empty:true` and `summary:true` for normal lookup and `search_auto_batch` with `retry_if_empty:true` and `summary:true` for alternate query phrasings.\n\
+At the start of a task, call `daemon_status` or `agent_guide`, then use `search_auto` with `retry_if_empty:true` and `summary:true` for normal lookup and `search_auto_batch` with `retry_if_empty:true` and `summary:true` for alternate query phrasings. On empty stale-index hits, `retry_if_empty:true` runs the scoped refresh once and returns the refreshed response as `primary_retry_result`.\n\
 Trust `daemon_status.search_auto_default` to see whether no-target `search_auto` will use a registered shard directory, warmed index, or the daemon current directory; run any `daemon_status.repair_requests`, then use `daemon_status.default_requests` for copyable first repo-map/search/query-plan calls.\n\
 When calling `search`, `search_batch`, `search_auto`, `search_auto_batch`, `repo_map`, `search_plan`, `find_symbol`, `read_range`, `read_ranges`, `related_files`, or `related_symbols` through JSON-lines/MCP without an explicit target, pass `cwd` so shared shard daemons scope results to the current git checkout.\n\
 Use query filters directly: `file:`, `path:`, `lang:`, `ext:`, `symbol:`, `type:`, `repo:`, `test:`, `generated:`, `code:`, `is:code`, `is:docs`, quoted literals, bare negative content terms like `-deprecated`, and negative filters like `-path:vendor` or `-is:generated`.\n\
@@ -3580,7 +3580,7 @@ fn primary_retry_result_value(request: &ResultToolRequest, result: Value) -> Res
 }
 
 fn primary_retry_result_summary(result: &Value) -> Value {
-    let results = result.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let results = search_result_values(result).unwrap_or(&[]);
     let mut summary = json!({
         "status": if results.is_empty() { "not_found" } else { "matched" },
         "result_count": results.len()
@@ -3631,6 +3631,15 @@ fn primary_retry_result_summary(result: &Value) -> Value {
         summary["min_score"] = json!(score);
     }
     summary
+}
+
+fn search_result_values(result: &Value) -> Option<&[Value]> {
+    result.as_array().map(Vec::as_slice).or_else(|| {
+        result
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+    })
 }
 
 fn value_summary_top_dirs(results: &[Value]) -> Vec<String> {
@@ -3692,6 +3701,13 @@ fn primary_retry_read_batch_request(
     request: &ResultToolRequest,
     result: &Value,
 ) -> Option<ResultToolRequest> {
+    if let Some(request) = result
+        .get("next_read_batch_request")
+        .or_else(|| result.get("read_batch_request"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        return Some(request);
+    }
     let base_arguments = retry_read_base_arguments(request)?;
     result_value_read_batch_request(result, "read_ranges", base_arguments)
 }
@@ -7142,11 +7158,6 @@ impl ToolRuntime {
                     (Some(result), Some(summary), diagnosis, primary)
                 })
                 .unwrap_or((None, None, None, None));
-        let primary_retry_result = self.search_auto_primary_retry_result(
-            retry_if_empty,
-            results.is_empty(),
-            primary_retry_request.as_ref(),
-        )?;
         let shard_route = self.cached_shard_route_stats(&index_dir, query, &filters)?;
         let freshness = self.search_auto_shard_freshness(
             !refresh_if_stale && (diagnose || results.is_empty()),
@@ -7155,6 +7166,21 @@ impl ToolRuntime {
             &shard_scope_filters,
             query,
         )?;
+        let refresh_request = freshness_refresh_request(&freshness);
+        let refresh_retry_result = self.search_auto_primary_retry_result(
+            retry_if_empty,
+            results.is_empty(),
+            refresh_request.as_ref(),
+        )?;
+        let primary_retry_result = if refresh_retry_result.is_some() {
+            refresh_retry_result
+        } else {
+            self.search_auto_primary_retry_result(
+                retry_if_empty,
+                results.is_empty(),
+                primary_retry_request.as_ref(),
+            )?
+        };
         let read_batch_request = result_read_batch_request(
             &results,
             "read_ranges",
@@ -7162,7 +7188,11 @@ impl ToolRuntime {
         );
         let next_read_batch_request =
             promoted_next_read_batch_request(&read_batch_request, &primary_retry_result);
-        let refresh_request = freshness_refresh_request(&freshness);
+        let refresh_request = if primary_retry_result.is_some() {
+            None
+        } else {
+            refresh_request
+        };
         let repo_map_request = auto_repo_map_request(
             "repo_map",
             "index_dir",
@@ -7272,11 +7302,6 @@ impl ToolRuntime {
             } else {
                 (None, None, None, None)
             };
-        let primary_retry_result = self.search_auto_primary_retry_result(
-            retry_if_empty,
-            results.is_empty(),
-            primary_retry_request.as_ref(),
-        )?;
         let freshness = self.search_auto_index_freshness(
             !refresh_if_stale && (diagnose || results.is_empty()),
             &index,
@@ -7284,6 +7309,21 @@ impl ToolRuntime {
             arguments,
             query,
         )?;
+        let refresh_request = freshness_refresh_request(&freshness);
+        let refresh_retry_result = self.search_auto_primary_retry_result(
+            retry_if_empty,
+            results.is_empty(),
+            refresh_request.as_ref(),
+        )?;
+        let primary_retry_result = if refresh_retry_result.is_some() {
+            refresh_retry_result
+        } else {
+            self.search_auto_primary_retry_result(
+                retry_if_empty,
+                results.is_empty(),
+                primary_retry_request.as_ref(),
+            )?
+        };
         let read_batch_request = result_read_batch_request(
             &results,
             "read_ranges",
@@ -7291,7 +7331,11 @@ impl ToolRuntime {
         );
         let next_read_batch_request =
             promoted_next_read_batch_request(&read_batch_request, &primary_retry_result);
-        let refresh_request = freshness_refresh_request(&freshness);
+        let refresh_request = if primary_retry_result.is_some() {
+            None
+        } else {
+            refresh_request
+        };
         let repo_map_request =
             auto_repo_map_request("repo_map", "index", &index_path, arguments, None);
         let next_action = search_auto_next_action(

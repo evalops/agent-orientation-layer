@@ -102,6 +102,10 @@ On a registered shard daemon, `search_auto_batch` resolves all query scopes and
 refreshes the selected shard roots once before running the batch, so agents can
 try alternate phrasings without paying repeated freshness scans.
 
+For single searches, `retry_if_empty:true` also runs a stale-index refresh once
+when an empty `search_auto` result reports `freshness.stale:true`, returning the
+refreshed response as `primary_retry_result`.
+
 ## Expected Loop
 
 1. Call `agent_guide` or `tool_manifest`.
