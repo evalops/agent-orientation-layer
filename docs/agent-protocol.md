@@ -55,8 +55,9 @@ For many repos:
 ```
 
 For an existing shard directory, call `register_shards` to cache only the
-manifest. Call `warm_shards` only when every shard index should be loaded
-immediately.
+manifest. Start the daemon with `--warm-repo /path/to/checkout` when one active
+repo should be hot immediately. Call `warm_shards` only when every shard index
+should be loaded immediately.
 
 `daemon_status`, or the direct CLI wrapper `orient daemon-status`, reports the
 daemon version, process id, start time, uptime, warmed indexes, registered shard

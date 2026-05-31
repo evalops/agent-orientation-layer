@@ -1199,6 +1199,11 @@ enum Commands {
         index_dirs: Vec<PathBuf>,
         #[arg(long = "warm-index-dir")]
         warm_index_dirs: Vec<PathBuf>,
+        #[arg(
+            long = "warm-repo",
+            help = "Warm only shard indexes whose repo root matches this path"
+        )]
+        warm_repos: Vec<PathBuf>,
         #[arg(long)]
         max_cached_indexes: Option<usize>,
         #[arg(long = "ensure-shards-dir")]
@@ -1226,6 +1231,11 @@ enum Commands {
         index_dirs: Vec<PathBuf>,
         #[arg(long = "warm-index-dir")]
         warm_index_dirs: Vec<PathBuf>,
+        #[arg(
+            long = "warm-repo",
+            help = "Warm only shard indexes whose repo root matches this path"
+        )]
+        warm_repos: Vec<PathBuf>,
         #[arg(long)]
         max_cached_indexes: Option<usize>,
         #[arg(long = "ensure-shards-dir")]
@@ -6244,6 +6254,7 @@ fn run() -> Result<()> {
             indexes,
             index_dirs,
             warm_index_dirs,
+            warm_repos,
             max_cached_indexes,
             ensure_shard_dirs,
             repos,
@@ -6258,6 +6269,7 @@ fn run() -> Result<()> {
                 indexes,
                 index_dirs,
                 warm_index_dirs,
+                warm_repos,
                 max_cached_indexes,
                 ensure_shard_dirs,
                 repos,
@@ -6288,6 +6300,7 @@ fn run() -> Result<()> {
             indexes,
             index_dirs,
             warm_index_dirs,
+            warm_repos,
             max_cached_indexes,
             ensure_shard_dirs,
             repos,
@@ -6306,6 +6319,7 @@ fn run() -> Result<()> {
                 indexes,
                 index_dirs,
                 warm_index_dirs,
+                warm_repos,
                 max_cached_indexes,
                 ensure_shard_dirs,
                 repos,
@@ -6345,6 +6359,7 @@ fn bootstrap_runtime(
     indexes: Vec<PathBuf>,
     index_dirs: Vec<PathBuf>,
     warm_index_dirs: Vec<PathBuf>,
+    warm_repos: Vec<PathBuf>,
     max_cached_indexes: Option<usize>,
     ensure_shard_dirs: Vec<PathBuf>,
     repos: Vec<PathBuf>,
@@ -6361,11 +6376,14 @@ fn bootstrap_runtime(
     for index in indexes {
         runtime.warm_index(index)?;
     }
+    let mut registered_shard_dirs = Vec::new();
     for index_dir in index_dirs {
-        runtime.register_shards(index_dir)?;
+        runtime.register_shards(index_dir.clone())?;
+        registered_shard_dirs.push(index_dir);
     }
     for index_dir in warm_index_dirs {
-        runtime.warm_shards(index_dir)?;
+        runtime.warm_shards(index_dir.clone())?;
+        registered_shard_dirs.push(index_dir);
     }
     let mut ensured_shards = Vec::new();
     if !ensure_shard_dirs.is_empty() {
@@ -6379,9 +6397,17 @@ fn bootstrap_runtime(
         )?;
         for index_dir in ensure_shard_dirs {
             let stats = ensure_shards(&selection.repos, &index_dir)?;
-            runtime.register_shards(index_dir)?;
+            runtime.register_shards(index_dir.clone())?;
+            registered_shard_dirs.push(index_dir.clone());
             ensured_shards.push(shard_bootstrap_output(stats, selection.discovery.clone())?);
         }
+    }
+    let mut warmed_repo_shards = 0usize;
+    for index_dir in registered_shard_dirs {
+        warmed_repo_shards += runtime.warm_shard_roots(index_dir, &warm_repos)?;
+    }
+    if !warm_repos.is_empty() && warmed_repo_shards == 0 {
+        bail!("--warm-repo did not match any registered shard repo roots");
     }
     Ok((runtime, ensured_shards))
 }

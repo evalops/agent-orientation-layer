@@ -26,7 +26,8 @@ orient ensure-shards \
 
 orient serve-tcp \
   --addr "$ORIENT_ADDR" \
-  --index-dir "$ORIENT_SHARDS"
+  --index-dir "$ORIENT_SHARDS" \
+  --warm-repo "$ORIENT_REPO"
 ```
 
 `--index-dir` registers the shard manifest and loads individual repo indexes
@@ -37,9 +38,12 @@ warmed shard count so startup warming does not immediately evict shards. Pass
 `--max-cached-indexes N`, set `ORIENT_MAX_SHARD_WORKERS=N` for per-query fanout,
 and set `ORIENT_MAX_DAEMON_SHARD_WORKERS=N` for aggregate daemon fanout. The
 daemon-wide fanout cap defaults to the per-query cap so many-agent runs do not
-multiply broad shard searches into CPU oversubscription. Use
-`--warm-index-dir "$ORIENT_SHARDS"` only when you explicitly want shard indexes
-loaded at startup.
+multiply broad shard searches into CPU oversubscription. Add one or more
+`--warm-repo /path/to/checkout` flags to prewarm active repos without loading
+every shard. This warms selected repo indexes; the first unique broad query can
+still pay query execution cost until the daemon's result cache is warm. Use
+`--warm-index-dir "$ORIENT_SHARDS"` only when you explicitly want all shard
+indexes loaded at startup.
 
 For one repo, use a single persisted index:
 

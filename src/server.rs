@@ -1439,6 +1439,25 @@ impl ToolRuntime {
         Ok(warmed)
     }
 
+    pub fn warm_shard_roots(&self, index_dir: PathBuf, roots: &[PathBuf]) -> Result<usize> {
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let wanted = roots
+            .iter()
+            .map(|root| canonical_cache_key(root))
+            .collect::<HashSet<_>>();
+        let manifest = self.cached_shard_manifest(&index_dir)?;
+        let mut warmed = 0usize;
+        for shard in &manifest.shards {
+            if wanted.contains(&canonical_cache_key(&shard.root)) {
+                self.warm_index(index_dir.join(&shard.index))?;
+                warmed += 1;
+            }
+        }
+        Ok(warmed)
+    }
+
     pub fn register_shards(&self, index_dir: PathBuf) -> Result<usize> {
         let manifest = self.cached_shard_manifest(&index_dir)?;
         Ok(manifest.shards.len())

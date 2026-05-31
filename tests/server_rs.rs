@@ -13895,6 +13895,69 @@ fn tcp_daemon_registers_shards_without_warming_indexes() {
 }
 
 #[test]
+fn tcp_daemon_warms_only_requested_shard_repo_on_startup() {
+    let workspace = tempfile::tempdir().unwrap();
+    let auth_repo = workspace.path().join("auth");
+    write(
+        &auth_repo.join("src/lib.rs"),
+        "pub fn issue_token() -> usize { 1 }\n",
+    );
+    let billing_repo = workspace.path().join("billing");
+    write(
+        &billing_repo.join("src/lib.rs"),
+        "pub fn invoice_total() -> usize { 42 }\n",
+    );
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&[auth_repo.clone(), billing_repo.clone()], shard_dir.path()).unwrap();
+
+    let binary = assert_cmd::cargo::cargo_bin("orient");
+    let mut child = Command::new(binary)
+        .args([
+            "serve-tcp",
+            "--addr",
+            "127.0.0.1:0",
+            "--index-dir",
+            shard_dir.path().to_str().unwrap(),
+            "--warm-repo",
+            billing_repo.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut startup_reader = BufReader::new(stdout);
+    let mut startup = String::new();
+    startup_reader.read_line(&mut startup).unwrap();
+    let startup_json: serde_json::Value = serde_json::from_str(&startup).unwrap();
+    let addr = startup_json["addr"].as_str().unwrap();
+    assert_eq!(startup_json["cached_indexes"], serde_json::json!(1));
+    assert_eq!(
+        startup_json["daemon_status"]["cached_shard_manifests"],
+        serde_json::json!(1)
+    );
+
+    let response = tcp_tool_request(
+        addr,
+        serde_json::json!({
+            "id": "search",
+            "tool": "search_shards",
+            "arguments": {
+                "query": "invoice total",
+                "limit": 3,
+                "repo_filter": billing_repo.to_string_lossy()
+            }
+        }),
+    );
+
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(response.contains("\"id\":\"search\""));
+    assert!(response.contains("src/lib.rs"));
+}
+
+#[test]
 fn tcp_daemon_honors_max_cached_indexes_for_lazy_shards() {
     let workspace = tempfile::tempdir().unwrap();
     let auth_repo = workspace.path().join("auth");
