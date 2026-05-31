@@ -19,7 +19,9 @@ use orient::server::{
     ToolRequest, ToolRuntime, agent_guide, agent_instructions, mcp_dispatch_value,
     mcp_tool_manifest, serve_mcp_with_runtime, tool_manifest,
 };
-use orient::shards::{DEFAULT_MAX_SHARD_WORKERS, build_shards, refresh_shards, shard_status};
+use orient::shards::{
+    DEFAULT_MAX_SHARD_WORKERS, ShardManifest, build_shards, refresh_shards, shard_status,
+};
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -10428,6 +10430,103 @@ fn runtime_clears_completed_shard_search_cache_on_refresh() {
     });
     assert!(refresh.error.is_none(), "{:?}", refresh.error);
     assert_eq!(runtime.completed_shard_search_cache_entry_count(), 0);
+}
+
+#[test]
+fn runtime_preserves_unaffected_repo_shard_search_cache_on_index_refresh() {
+    let workspace = tempfile::tempdir().unwrap();
+    let auth_repo = workspace.path().join("auth");
+    write(
+        &auth_repo.join("src/lib.rs"),
+        "pub fn issue_token() -> usize { 1 }\n",
+    );
+    write(
+        &auth_repo.join("Cargo.toml"),
+        "[package]\nname='auth'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    let billing_repo = workspace.path().join("billing");
+    write(
+        &billing_repo.join("src/lib.rs"),
+        "pub fn invoice_total() -> usize { 42 }\n",
+    );
+    write(
+        &billing_repo.join("Cargo.toml"),
+        "[package]\nname='billing'\nversion='0.1.0'\nedition='2024'\n",
+    );
+
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&[auth_repo.clone(), billing_repo.clone()], shard_dir.path()).unwrap();
+
+    let runtime = ToolRuntime::default();
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+    let search_auth = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("auth"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "issue token",
+            "limit": 3,
+            "repo": auth_repo.to_string_lossy(),
+            "require_all": true
+        }),
+    });
+    assert!(search_auth.error.is_none(), "{:?}", search_auth.error);
+    let search_billing = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("billing"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "invoice total",
+            "limit": 3,
+            "repo": billing_repo.to_string_lossy(),
+            "require_all": true
+        }),
+    });
+    assert!(search_billing.error.is_none(), "{:?}", search_billing.error);
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 2);
+
+    let manifest: ShardManifest =
+        serde_json::from_str(&fs::read_to_string(shard_dir.path().join("manifest.json")).unwrap())
+            .unwrap();
+    let auth_repo_key = auth_repo.canonicalize().unwrap();
+    let auth_shard = manifest
+        .shards
+        .iter()
+        .find(|shard| shard.root.canonicalize().unwrap() == auth_repo_key)
+        .unwrap();
+    thread::sleep(Duration::from_millis(20));
+    write(
+        &auth_repo.join("src/lib.rs"),
+        "pub fn issue_token() -> usize { 1 }\npub fn fresh_auth_token() -> usize { 2 }\n",
+    );
+    runtime
+        .refresh_index(auth_repo.clone(), shard_dir.path().join(&auth_shard.index))
+        .unwrap();
+
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 1);
+    let hits_before = runtime.completed_shard_search_cache_hit_count();
+    let search_billing_again = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("billing-again"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "invoice total",
+            "limit": 3,
+            "repo": billing_repo.to_string_lossy(),
+            "require_all": true
+        }),
+    });
+    assert!(
+        search_billing_again.error.is_none(),
+        "{:?}",
+        search_billing_again.error
+    );
+    assert!(
+        runtime.completed_shard_search_cache_hit_count() > hits_before,
+        "refreshing auth should leave billing's completed shard search cache hot"
+    );
 }
 
 #[test]

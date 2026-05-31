@@ -1291,6 +1291,12 @@ struct CachedIndexSnapshot {
     fingerprint: Option<CacheFileFingerprint>,
 }
 
+#[derive(Clone)]
+struct AffectedShardIndex {
+    index_dir: PathBuf,
+    shard: ShardEntry,
+}
+
 #[derive(Default)]
 struct CacheDiskState {
     bytes: Option<u64>,
@@ -7569,6 +7575,57 @@ impl ToolRuntime {
         Ok(())
     }
 
+    fn invalidate_completed_shard_work_for_index_dir(&self, index_dir: &Path) -> Result<()> {
+        let index_dir = canonical_cache_key(index_dir);
+        self.completed_shard_searches
+            .lock()
+            .map_err(|_| anyhow!("completed shard search cache lock poisoned"))?
+            .retain(|key, _| key.index_dir != index_dir);
+        self.completed_shard_query_plans
+            .lock()
+            .map_err(|_| anyhow!("completed shard query-plan cache lock poisoned"))?
+            .retain(|key, _| key.index_dir != index_dir);
+        self.completed_shard_route_stats
+            .lock()
+            .map_err(|_| anyhow!("completed shard route cache lock poisoned"))?
+            .retain(|key, _| key.index_dir != index_dir);
+        self.completed_shard_freshness
+            .lock()
+            .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?
+            .retain(|key, _| key.index_dir != index_dir);
+        Ok(())
+    }
+
+    fn invalidate_completed_shard_work_for_index_path(&self, index_path: &Path) -> Result<()> {
+        let Some(affected) = self.cached_shard_index_for_index_path(index_path)? else {
+            return Ok(());
+        };
+        self.invalidate_completed_shard_work_for_shard(&affected)
+    }
+
+    fn invalidate_completed_shard_work_for_shard(
+        &self,
+        affected: &AffectedShardIndex,
+    ) -> Result<()> {
+        self.completed_shard_searches
+            .lock()
+            .map_err(|_| anyhow!("completed shard search cache lock poisoned"))?
+            .retain(|key, _| !shard_search_key_matches_affected_shard(key, affected));
+        self.completed_shard_query_plans
+            .lock()
+            .map_err(|_| anyhow!("completed shard query-plan cache lock poisoned"))?
+            .retain(|key, _| !shard_query_plan_key_matches_affected_shard(key, affected));
+        self.completed_shard_route_stats
+            .lock()
+            .map_err(|_| anyhow!("completed shard route cache lock poisoned"))?
+            .retain(|key, _| !shard_query_plan_key_matches_affected_shard(key, affected));
+        self.completed_shard_freshness
+            .lock()
+            .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?
+            .retain(|key, _| !shard_freshness_key_matches_affected_shard(key, affected));
+        Ok(())
+    }
+
     fn cached_completed_shard_search(
         &self,
         key: &ShardSearchKey,
@@ -7787,7 +7844,7 @@ impl ToolRuntime {
                 );
         }
         self.evict_cached_indexes_if_needed(&key)?;
-        self.invalidate_completed_shard_work_caches()?;
+        self.invalidate_completed_shard_work_for_index_path(&key)?;
         Ok(key)
     }
 
@@ -7816,7 +7873,7 @@ impl ToolRuntime {
             };
 
             if stale_ready {
-                self.invalidate_completed_shard_work_caches()?;
+                self.invalidate_completed_shard_work_for_index_path(&key)?;
             }
 
             if should_load {
@@ -8086,6 +8143,29 @@ impl ToolRuntime {
             .unwrap_or_default()
     }
 
+    fn cached_shard_index_for_index_path(
+        &self,
+        index_path: &Path,
+    ) -> Result<Option<AffectedShardIndex>> {
+        let index_path = canonical_cache_key(index_path);
+        let manifests = self
+            .shard_manifests
+            .lock()
+            .map_err(|_| anyhow!("shard manifest cache lock poisoned"))?;
+        for (index_dir, cached) in manifests.iter() {
+            for shard in &cached.manifest.shards {
+                let shard_index_path = canonical_cache_key(&index_dir.join(&shard.index));
+                if shard_index_path == index_path {
+                    return Ok(Some(AffectedShardIndex {
+                        index_dir: index_dir.clone(),
+                        shard: shard.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn resolve_shard_path_cached(
         &self,
         index_dir: &Path,
@@ -8114,7 +8194,7 @@ impl ToolRuntime {
             .lock()
             .map_err(|_| anyhow!("index cache lock poisoned"))?
             .retain(|path, _| !path.starts_with(&index_dir));
-        self.invalidate_completed_shard_work_caches()?;
+        self.invalidate_completed_shard_work_for_index_dir(&index_dir)?;
         Ok(())
     }
 
@@ -8122,7 +8202,7 @@ impl ToolRuntime {
         let Some(max_ready_indexes) = self.cache_policy.max_ready_indexes else {
             return Ok(());
         };
-        let mut evicted = false;
+        let mut victims = Vec::new();
         {
             let mut indexes = self
                 .indexes
@@ -8145,11 +8225,11 @@ impl ToolRuntime {
                     break;
                 };
                 indexes.remove(&victim);
-                evicted = true;
+                victims.push(victim);
             }
         }
-        if evicted {
-            self.invalidate_completed_shard_work_caches()?;
+        for victim in victims {
+            self.invalidate_completed_shard_work_for_index_path(&victim)?;
         }
         Ok(())
     }
@@ -8994,6 +9074,40 @@ fn canonical_cache_key(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+fn shard_search_key_matches_affected_shard(
+    key: &ShardSearchKey,
+    affected: &AffectedShardIndex,
+) -> bool {
+    key.index_dir == affected.index_dir
+        && shard_filter_may_touch_affected_shard(&key.filters, affected)
+}
+
+fn shard_query_plan_key_matches_affected_shard(
+    key: &ShardQueryPlanKey,
+    affected: &AffectedShardIndex,
+) -> bool {
+    key.index_dir == affected.index_dir
+        && shard_filter_may_touch_affected_shard(&key.filters, affected)
+}
+
+fn shard_freshness_key_matches_affected_shard(
+    key: &ShardFreshnessKey,
+    affected: &AffectedShardIndex,
+) -> bool {
+    key.index_dir == affected.index_dir
+        && key
+            .roots
+            .iter()
+            .any(|root| canonical_cache_key(root) == canonical_cache_key(&affected.shard.root))
+}
+
+fn shard_filter_may_touch_affected_shard(
+    filters: &SearchFilters,
+    affected: &AffectedShardIndex,
+) -> bool {
+    !shard_search_scopes(&affected.shard, filters).is_empty()
 }
 
 fn evict_oldest_completed_work<K: Clone + Eq + Hash, T>(
