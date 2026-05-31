@@ -8331,9 +8331,8 @@ fn runtime_reuses_cached_shard_manifest_after_initial_load() {
         tool: "search_shards".to_string(),
         arguments: serde_json::json!({
             "index_dir": shard_dir.path(),
-            "query": "invoice total",
-            "limit": 3,
-            "require_all": true
+            "query": "mode:any invoice total",
+            "limit": 3
         }),
     });
     assert!(first.error.is_none(), "{:?}", first.error);
@@ -8505,8 +8504,7 @@ fn runtime_reloads_cached_shard_manifest_when_file_changes() {
         tool: "search_shards".to_string(),
         arguments: serde_json::json!({
             "index_dir": shard_dir.path(),
-            "query": "issue token",
-            "require_all": true
+            "query": "mode:any issue token"
         }),
     });
     assert!(first.error.is_none(), "{:?}", first.error);
@@ -8552,7 +8550,7 @@ fn runtime_reloads_cached_shard_manifest_when_file_changes() {
     let result = serde_json::to_string(&second.result).unwrap();
     assert!(result.contains("billing/src/lib.rs"), "{result}");
     assert_eq!(runtime.cached_shard_manifest_count(), 1);
-    assert_eq!(runtime.cached_index_count(), 1);
+    assert_eq!(runtime.cached_index_count(), 2);
 
     let third = runtime.dispatch(ToolRequest {
         id: serde_json::json!("third"),

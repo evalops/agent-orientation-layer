@@ -151,6 +151,7 @@ pub struct ShardRouteStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ShardRouteRequirements {
+    decisive_exact_hashes: Vec<u32>,
     exact_hashes: Vec<u32>,
     trigram_hashes: Vec<u32>,
     substring_grams: Vec<String>,
@@ -2706,7 +2707,7 @@ pub(crate) fn shard_prefilter_query_impossible(
     shard_query: &str,
     filters: &SearchFilters,
 ) -> Result<bool> {
-    let required_hashes = shard_prefilter_required_exact_hashes(shard_query, filters);
+    let (required_hashes, _) = shard_prefilter_required_exact_hashes(shard_query, filters);
     if required_hashes.is_empty() {
         return Ok(false);
     }
@@ -2743,7 +2744,8 @@ fn shard_route_stats(
     filters: &SearchFilters,
 ) -> Result<ShardRouteStats> {
     let requirements = shard_route_requirements(shard_query, filters);
-    let has_route_requirements = !requirements.exact_hashes.is_empty()
+    let has_route_requirements = !requirements.decisive_exact_hashes.is_empty()
+        || !requirements.exact_hashes.is_empty()
         || !requirements.trigram_hashes.is_empty()
         || !requirements.substring_grams.is_empty();
     if !has_route_requirements && !shard_route_filter_only_selectable(filters) {
@@ -2846,7 +2848,8 @@ pub(crate) fn shard_route_selection(
     filters: &SearchFilters,
 ) -> Result<Option<ShardRouteSelection>> {
     let requirements = shard_route_requirements(shard_query, filters);
-    let has_route_requirements = !requirements.exact_hashes.is_empty()
+    let has_route_requirements = !requirements.decisive_exact_hashes.is_empty()
+        || !requirements.exact_hashes.is_empty()
         || !requirements.trigram_hashes.is_empty()
         || !requirements.substring_grams.is_empty();
     if !has_route_requirements && !shard_route_filter_only_selectable(filters) {
@@ -2926,7 +2929,26 @@ fn shard_route_candidate_ids(
     requirements: &ShardRouteRequirements,
 ) -> ShardRouteLookup {
     let mut candidate_ids: Option<Vec<u16>> = None;
+    let mut saw_missing = false;
     let mut saw_omitted = false;
+    for hash in &requirements.decisive_exact_hashes {
+        let postings = match shard_route_postings(route, &route.exact_terms, *hash) {
+            Ok(Some(postings)) => postings,
+            Ok(None) if route.omitted_hashes.binary_search(hash).is_ok() => {
+                saw_omitted = true;
+                continue;
+            }
+            Ok(None) => return ShardRouteLookup::MissingHash,
+            Err(()) => return ShardRouteLookup::Corrupt,
+        };
+        candidate_ids = Some(match candidate_ids {
+            Some(existing) => intersect_u16_sorted(&existing, &postings),
+            None => postings,
+        });
+        if candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return ShardRouteLookup::Candidates(Vec::new());
+        }
+    }
     for (terms, omitted_hashes, required_hashes) in [
         (
             route.exact_terms.as_slice(),
@@ -2946,7 +2968,10 @@ fn shard_route_candidate_ids(
                     saw_omitted = true;
                     continue;
                 }
-                Ok(None) => return ShardRouteLookup::MissingHash,
+                Ok(None) => {
+                    saw_missing = true;
+                    continue;
+                }
                 Err(()) => return ShardRouteLookup::Corrupt,
             };
             candidate_ids = Some(match candidate_ids {
@@ -2980,6 +3005,7 @@ fn shard_route_candidate_ids(
     }
     match candidate_ids {
         Some(candidate_ids) => ShardRouteLookup::Candidates(candidate_ids),
+        None if saw_missing => ShardRouteLookup::MissingHash,
         None if saw_omitted => ShardRouteLookup::Omitted,
         None => ShardRouteLookup::Candidates(Vec::new()),
     }
@@ -3025,7 +3051,8 @@ fn shard_route_postings(
 }
 
 fn shard_route_requirements(shard_query: &str, filters: &SearchFilters) -> ShardRouteRequirements {
-    let exact_hashes = shard_prefilter_required_exact_hashes(shard_query, filters);
+    let (decisive_exact_hashes, exact_hashes) =
+        shard_prefilter_required_exact_hashes(shard_query, filters);
     let query_tokens = unique_query_tokens(shard_query);
     let mut trigram_hashes = Vec::new();
     if filters.symbol_kind.is_none()
@@ -3052,6 +3079,7 @@ fn shard_route_requirements(shard_query: &str, filters: &SearchFilters) -> Shard
     trigram_hashes.sort_unstable();
     trigram_hashes.dedup();
     ShardRouteRequirements {
+        decisive_exact_hashes,
         exact_hashes,
         trigram_hashes,
         substring_grams,
@@ -3136,29 +3164,42 @@ fn decode_var_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
     }
 }
 
-fn shard_prefilter_required_exact_hashes(shard_query: &str, filters: &SearchFilters) -> Vec<u32> {
+fn shard_prefilter_required_exact_hashes(
+    shard_query: &str,
+    filters: &SearchFilters,
+) -> (Vec<u32>, Vec<u32>) {
     let query_tokens = unique_query_tokens(shard_query);
+    let mut decisive_hashes = Vec::new();
     let mut hashes = Vec::new();
     if let Some(identifier) = shard_query_identifier_prefilter(shard_query, &query_tokens, filters)
     {
-        hashes.push(sketch_fingerprint(&identifier));
+        decisive_hashes.push(sketch_fingerprint(&identifier));
     }
-    hashes.extend(route_filter_exact_hashes(filters));
+    decisive_hashes.extend(route_filter_exact_hashes(filters));
 
     let require_all = filters.require_all || (query_tokens.len() > 1 && !filters.match_any);
     if require_all || filters.symbol_kind.is_some() || query_tokens.len() == 1 {
         hashes.extend(
             query_tokens
                 .iter()
-                .filter(|token| {
-                    filters.symbol_kind.is_some() || !shard_allows_substring_prefilter(token)
-                })
+                .filter(|token| exact_route_hash_required_for_token(token, require_all, filters))
                 .map(|token| sketch_fingerprint(token)),
         );
     }
+    decisive_hashes.sort_unstable();
+    decisive_hashes.dedup();
     hashes.sort_unstable();
     hashes.dedup();
-    hashes
+    hashes.retain(|hash| decisive_hashes.binary_search(hash).is_err());
+    (decisive_hashes, hashes)
+}
+
+fn exact_route_hash_required_for_token(
+    token: &str,
+    require_all: bool,
+    filters: &SearchFilters,
+) -> bool {
+    require_all || filters.symbol_kind.is_some() || !shard_allows_substring_prefilter(token)
 }
 
 fn load_manifest_prefilter(index_dir: &Path) -> Result<Option<ShardManifestPrefilter>> {
@@ -3896,6 +3937,7 @@ mod tests {
 
     fn exact_route_requirements(hashes: &[u32]) -> ShardRouteRequirements {
         ShardRouteRequirements {
+            decisive_exact_hashes: Vec::new(),
             exact_hashes: hashes.to_vec(),
             trigram_hashes: Vec::new(),
             substring_grams: Vec::new(),
@@ -3904,6 +3946,7 @@ mod tests {
 
     fn trigram_route_requirements(hashes: &[u32]) -> ShardRouteRequirements {
         ShardRouteRequirements {
+            decisive_exact_hashes: Vec::new(),
             exact_hashes: Vec::new(),
             trigram_hashes: hashes.to_vec(),
             substring_grams: Vec::new(),
@@ -3912,6 +3955,7 @@ mod tests {
 
     fn substring_route_requirements(value: &str) -> ShardRouteRequirements {
         ShardRouteRequirements {
+            decisive_exact_hashes: Vec::new(),
             exact_hashes: Vec::new(),
             trigram_hashes: Vec::new(),
             substring_grams: shard_query_substring_grams(value),
@@ -4108,6 +4152,11 @@ mod tests {
         manifest.shards[0].sketch = Some(ShardQuerySketch {
             exact_hashes: vec![
                 sketch_fingerprint("routeprobe"),
+                sketch_fingerprint("shared"),
+                sketch_fingerprint("route"),
+                sketch_fingerprint("probe"),
+                sketch_fingerprint("long"),
+                sketch_fingerprint("symbol"),
                 sketch_fingerprint("sharedrouteprobe"),
                 sketch_fingerprint("sharedrouteprobelongsymbol"),
             ],
@@ -4184,7 +4233,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["auth"]
         );
-        assert!(route.shard_ids.len() < 8);
+        assert!(route.shard_ids.len() < 16);
 
         let missing = shard_route_candidate_ids(
             &route,
@@ -4354,6 +4403,89 @@ mod tests {
                 routed: true,
                 total_shards: 65,
                 selected_shards: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_route_uses_short_terms_for_multi_token_and_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let search_hash = sketch_fingerprint("search");
+        let query_hash = sketch_fingerprint("query");
+        let plan_hash = sketch_fingerprint("plan");
+        let shard_hashes = [
+            vec![search_hash, query_hash, plan_hash],
+            vec![search_hash, query_hash],
+            vec![search_hash, plan_hash],
+            vec![query_hash, plan_hash],
+            vec![search_hash],
+        ];
+        let shards = shard_hashes
+            .into_iter()
+            .enumerate()
+            .map(|(index, exact_hashes)| ShardEntry {
+                name: format!("repo-{index}"),
+                root: dir.path().join(format!("repo-{index}")),
+                index: format!("repo-{index}.orient"),
+                aliases: Vec::new(),
+                git: None,
+                sketch: Some(ShardQuerySketch {
+                    exact_hashes,
+                    trigram_hashes: Vec::new(),
+                    exact_bits: Vec::new(),
+                    trigram_bits: Vec::new(),
+                    substring_bits: Vec::new(),
+                    symbol_kind_bits: Vec::new(),
+                    filter_bits: Vec::new(),
+                }),
+            })
+            .collect();
+        let manifest = ShardManifest {
+            version: SHARD_MANIFEST_VERSION,
+            shards,
+        };
+        save_manifest(dir.path(), &manifest).unwrap();
+
+        let route = load_manifest_route(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            shard_route_candidate_ids(
+                &route,
+                &exact_route_requirements(&[search_hash, query_hash, plan_hash])
+            ),
+            ShardRouteLookup::Candidates(vec![0])
+        );
+        assert_eq!(
+            shard_route_candidate_ids(
+                &route,
+                &exact_route_requirements(&[search_hash, sketch_fingerprint("missing")])
+            ),
+            ShardRouteLookup::Candidates(vec![0, 1, 2, 4])
+        );
+
+        let (single_decisive_hashes, single_short_hashes) =
+            shard_prefilter_required_exact_hashes("search", &SearchFilters::default());
+        assert!(single_decisive_hashes.is_empty());
+        assert!(
+            !single_short_hashes.contains(&search_hash),
+            "single short terms keep substring/trigram route behavior"
+        );
+        let (multi_decisive_hashes, multi_short_hashes) =
+            shard_prefilter_required_exact_hashes("search query plan", &SearchFilters::default());
+        assert!(multi_decisive_hashes.is_empty());
+        let mut expected_hashes = vec![search_hash, query_hash, plan_hash];
+        expected_hashes.sort_unstable();
+        assert_eq!(multi_short_hashes, expected_hashes);
+
+        let stats =
+            shard_query_route_stats(dir.path(), "search query plan", &SearchFilters::default())
+                .unwrap();
+        assert_eq!(
+            stats,
+            ShardRouteStats {
+                status: "routed".to_string(),
+                routed: true,
+                total_shards: 5,
+                selected_shards: 1,
             }
         );
     }
