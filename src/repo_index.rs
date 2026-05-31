@@ -499,6 +499,38 @@ pub struct QueryPlanSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryPlanAdvice {
+    pub status: String,
+    pub summary: String,
+    pub next_action: String,
+    pub candidate_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub final_match_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_hint_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_hint_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<QueryPlanAdviceHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_cli: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_jsonl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_client_cli: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanAdviceHint {
+    pub kind: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryPlanNextAction {
     pub kind: String,
     pub source: String,
@@ -541,6 +573,10 @@ impl QueryPlan {
 
     pub fn compact_summary(&self) -> QueryPlanSummary {
         QueryPlanSummary::from_plan(self)
+    }
+
+    pub fn advice(&self) -> QueryPlanAdvice {
+        QueryPlanAdvice::from_plan(self)
     }
 
     fn refresh_summary(&mut self) {
@@ -588,6 +624,52 @@ impl QueryPlanSummary {
             suggested_query: diagnosis.suggested_query,
             primary_retry_request: plan.primary_retry_request.clone(),
             promoted_next_action: plan.next_action.clone(),
+        }
+    }
+}
+
+impl QueryPlanAdvice {
+    fn from_plan(plan: &QueryPlan) -> Self {
+        let diagnosis = plan
+            .diagnosis
+            .clone()
+            .unwrap_or_else(|| QueryPlanDiagnosis::from_plan(plan));
+        let retry_request = plan
+            .primary_retry_request
+            .as_ref()
+            .or_else(|| plan.retry_requests.first());
+        Self {
+            status: diagnosis.status,
+            summary: diagnosis.summary,
+            next_action: diagnosis.next_action,
+            candidate_count: plan.candidate_count,
+            final_match_count: plan.final_match_count,
+            primary_hint_kind: diagnosis.primary_hint_kind,
+            primary_hint_action: diagnosis.primary_hint_action,
+            suggested_query: diagnosis.suggested_query,
+            hints: plan
+                .repair_hints
+                .iter()
+                .take(MAX_QUERY_PLAN_SUMMARY_REPAIR_HINTS)
+                .map(QueryPlanAdviceHint::from)
+                .collect(),
+            retry_cli: retry_request.and_then(|request| request.cli.clone()),
+            retry_jsonl: retry_request
+                .map(|request| request.jsonl.clone())
+                .filter(|jsonl| !jsonl.is_empty()),
+            retry_client_cli: retry_request
+                .map(|request| request.client_cli.clone())
+                .filter(|command| !command.is_empty()),
+        }
+    }
+}
+
+impl From<&QueryPlanRepairHint> for QueryPlanAdviceHint {
+    fn from(hint: &QueryPlanRepairHint) -> Self {
+        Self {
+            kind: hint.kind.clone(),
+            action: hint.action.clone(),
+            suggested_query: hint.suggested_query.clone(),
         }
     }
 }

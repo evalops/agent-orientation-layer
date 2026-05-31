@@ -3378,6 +3378,47 @@ fn cli_search_surfaces_accept_structured_filters() {
     assert!(summary_plan.get("retry_requests").is_none());
     assert!(summary_plan.get("query_tokens").is_none());
 
+    let mut search_plan_advice = Command::cargo_bin("orient").unwrap();
+    let advice_output = search_plan_advice
+        .args([
+            "search-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "SessionManager definitely_missing",
+            "--dir",
+            "src",
+            "--advice",
+        ])
+        .output()
+        .unwrap();
+    assert!(advice_output.status.success());
+    let advice_plan: serde_json::Value = serde_json::from_slice(&advice_output.stdout).unwrap();
+    assert_eq!(advice_plan["status"], serde_json::json!("missing_terms"));
+    assert_eq!(
+        advice_plan["primary_hint_kind"],
+        serde_json::json!("drop_missing_terms")
+    );
+    assert_eq!(
+        advice_plan["suggested_query"],
+        serde_json::json!("session manager")
+    );
+    assert!(
+        advice_plan["retry_cli"]
+            .as_str()
+            .unwrap()
+            .contains("orient search")
+    );
+    assert!(
+        advice_plan["retry_jsonl"]
+            .as_str()
+            .unwrap()
+            .contains("\"tool\":\"search\"")
+    );
+    assert!(!advice_plan["hints"].as_array().unwrap().is_empty());
+    assert!(advice_plan.get("primary_retry_request").is_none());
+    assert!(advice_plan.get("planned_postings").is_none());
+    assert!(advice_plan.get("query_tokens").is_none());
+
     let mut search_plan_batch = Command::cargo_bin("orient").unwrap();
     search_plan_batch
         .args([
@@ -3427,6 +3468,37 @@ fn cli_search_surfaces_accept_structured_filters() {
     );
     assert!(batch_items[0].get("plan").is_none());
     assert!(batch_items[0].get("plans").is_none());
+
+    let mut search_plan_batch_advice = Command::cargo_bin("orient").unwrap();
+    let batch_advice_output = search_plan_batch_advice
+        .args([
+            "search-plan-batch",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--require-all",
+            "--advice",
+            "SessionManager definitely_missing",
+            "issue absentterm",
+        ])
+        .output()
+        .unwrap();
+    assert!(batch_advice_output.status.success());
+    let batch_advice: serde_json::Value =
+        serde_json::from_slice(&batch_advice_output.stdout).unwrap();
+    let batch_advice_items = batch_advice.as_array().unwrap();
+    assert_eq!(batch_advice_items.len(), 2);
+    assert_eq!(
+        batch_advice_items[0]["advice"]["primary_hint_kind"],
+        serde_json::json!("drop_missing_terms")
+    );
+    assert!(
+        batch_advice_items[0]["advice"]["retry_client_cli"]
+            .as_str()
+            .unwrap()
+            .contains("orient client-jsonl")
+    );
+    assert!(batch_advice_items[0].get("summary").is_none());
+    assert!(batch_advice_items[0].get("plan").is_none());
 
     let mut index_plan = Command::cargo_bin("orient").unwrap();
     index_plan

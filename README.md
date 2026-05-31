@@ -157,6 +157,9 @@ canonical result. Use those compact fields first; open the full plan only when a
 wrapper needs detailed diagnostics. For direct diagnostics, pass JSON-lines
 `summary:true` or add `--summary` to `search-auto`, `search-auto-batch`,
 `search-plan`, `search-plan-batch`, `index-plan`, or `index-plan-batch`.
+When an adapter only needs the next move, plan tools also accept `advice:true`
+or `--advice`; that returns status, the suggested query, top hint kinds, and
+ready retry CLI/JSONL strings without full plan payloads.
 
 Batch read follow-ups include `read_budget` so wrappers can split large reads
 before hitting range or line caps. Manual reads accept copied file locations such

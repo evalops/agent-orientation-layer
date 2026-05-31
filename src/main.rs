@@ -8,7 +8,7 @@ use orient::fast_index::{FastIndex, INDEX_FORMAT_VERSION, RefreshStats};
 use orient::query::{merge_filters, normalize_symbol_kind, parse_query};
 use orient::repo_index::{
     DEFAULT_REPO_MAP_READ_BATCH_RANGES, FileRange, MAX_READ_RANGE_LINES,
-    MAX_RESULT_READ_BATCH_RANGES, QueryPlan, QueryPlanFilter, QueryPlanNextAction,
+    MAX_RESULT_READ_BATCH_RANGES, QueryPlan, QueryPlanAdvice, QueryPlanFilter, QueryPlanNextAction,
     QueryPlanSummary, RangeScope, RepoIndexer, RepoMapDetail, ResultToolRequest, SearchFilters,
     SearchResult, SnippetMode, SymbolLookupResult, attach_repo_map_read_batch_request_with_limit,
     attach_result_context, attach_result_read_requests, attach_result_related_requests,
@@ -393,6 +393,8 @@ enum Commands {
         refresh_if_stale: bool,
         #[arg(long)]
         summary: bool,
+        #[arg(long, conflicts_with = "summary")]
+        advice: bool,
     },
     IndexPlanBatch {
         #[arg(long)]
@@ -407,6 +409,8 @@ enum Commands {
         refresh_if_stale: bool,
         #[arg(long)]
         summary: bool,
+        #[arg(long, conflicts_with = "summary")]
+        advice: bool,
     },
     SearchPlan {
         #[arg(long, default_value = ".")]
@@ -427,6 +431,8 @@ enum Commands {
         refresh_if_stale: bool,
         #[arg(long)]
         summary: bool,
+        #[arg(long, conflicts_with = "summary")]
+        advice: bool,
     },
     SearchPlanBatch {
         #[arg(long, default_value = ".")]
@@ -445,6 +451,8 @@ enum Commands {
         refresh_if_stale: bool,
         #[arg(long)]
         summary: bool,
+        #[arg(long, conflicts_with = "summary")]
+        advice: bool,
     },
     #[command(visible_alias = "open-range")]
     ReadRange {
@@ -1985,6 +1993,13 @@ fn compact_query_plan_batch_result(query: String, plan: &QueryPlan) -> Value {
     Value::Object(item)
 }
 
+fn advice_query_plan_batch_result(query: String, plan: &QueryPlan) -> Value {
+    let mut item = Map::new();
+    item.insert("query".to_string(), Value::String(query));
+    item.insert("advice".to_string(), query_plan_advice_value(plan));
+    Value::Object(item)
+}
+
 fn compact_shard_query_plan_batch_result(query: String, plans: &[ShardQueryPlan]) -> Value {
     let mut item = Map::new();
     item.insert("query".to_string(), Value::String(query));
@@ -2015,6 +2030,13 @@ fn compact_shard_query_plan_batch_result(query: String, plans: &[ShardQueryPlan]
         "shards".to_string(),
         cli_query_plan_summary_from_shard_plans(plans),
     );
+    Value::Object(item)
+}
+
+fn advice_shard_query_plan_batch_result(query: String, plans: &[ShardQueryPlan]) -> Value {
+    let mut item = Map::new();
+    item.insert("query".to_string(), Value::String(query));
+    item.insert("advice".to_string(), shard_query_plan_advice_value(plans));
     Value::Object(item)
 }
 
@@ -2764,6 +2786,30 @@ fn primary_cli_diagnosis_from_plan(plan: &QueryPlan) -> Option<Value> {
 
 fn cli_query_plan_summary_from_plan(plan: &QueryPlan) -> Option<Value> {
     serde_json::to_value(plan.compact_summary()).ok()
+}
+
+fn query_plan_advice_value(plan: &QueryPlan) -> Value {
+    let advice: QueryPlanAdvice = plan.advice();
+    serde_json::to_value(advice).unwrap_or(Value::Null)
+}
+
+fn shard_query_plan_advice_value(plans: &[ShardQueryPlan]) -> Value {
+    let selected = plans
+        .iter()
+        .find(|shard_plan| {
+            shard_plan.plan.final_match_count > 0 || shard_plan.plan.next_action.is_some()
+        })
+        .or_else(|| plans.first());
+    let mut value = selected
+        .map(|shard_plan| query_plan_advice_value(&shard_plan.plan))
+        .unwrap_or_else(|| query_plan_advice_value(&QueryPlan::empty("no_shards", true)));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("shard_count".to_string(), serde_json::json!(plans.len()));
+        if let Some(selected) = selected {
+            object.insert("shard".to_string(), serde_json::json!(selected.name));
+        }
+    }
+    value
 }
 
 fn primary_cli_retry_request_from_shard_plans(plans: &[ShardQueryPlan]) -> Option<Value> {
@@ -3740,6 +3786,7 @@ fn run() -> Result<()> {
             filters,
             refresh_if_stale,
             summary,
+            advice,
         } => {
             let index_path = index;
             let index = load_index_for_search(index_path.clone(), refresh_if_stale)?;
@@ -3752,7 +3799,9 @@ fn run() -> Result<()> {
                 &index_path,
                 &filters,
             );
-            if summary {
+            if advice {
+                println!("{}", serde_json::to_string(&plan.advice())?);
+            } else if summary {
                 println!("{}", serde_json::to_string(&plan.compact_summary())?);
             } else {
                 println!("{}", serde_json::to_string(&plan)?);
@@ -3765,6 +3814,7 @@ fn run() -> Result<()> {
             filters,
             refresh_if_stale,
             summary,
+            advice,
         } => {
             let queries = cli_batch_queries(queries)?;
             let index_path = index;
@@ -3779,7 +3829,9 @@ fn run() -> Result<()> {
                     &index_path,
                     &filters,
                 );
-                if summary {
+                if advice {
+                    batch.push(advice_query_plan_batch_result(query, &plan));
+                } else if summary {
                     batch.push(compact_query_plan_batch_result(query, &plan));
                 } else {
                     batch.push(serde_json::to_value(indexed_query_plan_batch_result(
@@ -3799,6 +3851,7 @@ fn run() -> Result<()> {
             filters,
             refresh_if_stale,
             summary,
+            advice,
         } => {
             let filters = search_filters_from_args(&filters, repo_filter)?;
             let query = cli_single_query_for_filters(query, query_arg, &filters)?;
@@ -3810,7 +3863,12 @@ fn run() -> Result<()> {
                 attach_cli_shard_retry_requests_with_tool(
                     &mut plans, "search", &index_dir, &filters,
                 );
-                if summary {
+                if advice {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&shard_query_plan_advice_value(&plans))?
+                    );
+                } else if summary {
                     println!(
                         "{}",
                         serde_json::to_string(&cli_query_plan_summary_from_shard_plans(&plans))?
@@ -3827,7 +3885,9 @@ fn run() -> Result<()> {
                     &index_path,
                     &filters,
                 );
-                if summary {
+                if advice {
+                    println!("{}", serde_json::to_string(&plan.advice())?);
+                } else if summary {
                     println!("{}", serde_json::to_string(&plan.compact_summary())?);
                 } else {
                     println!("{}", serde_json::to_string(&plan)?);
@@ -3841,7 +3901,9 @@ fn run() -> Result<()> {
                     &index.root,
                     &filters,
                 );
-                if summary {
+                if advice {
+                    println!("{}", serde_json::to_string(&plan.advice())?);
+                } else if summary {
                     println!("{}", serde_json::to_string(&plan.compact_summary())?);
                 } else {
                     println!("{}", serde_json::to_string(&plan)?);
@@ -3857,6 +3919,7 @@ fn run() -> Result<()> {
             filters,
             refresh_if_stale,
             summary,
+            advice,
         } => {
             let queries = cli_batch_queries(queries)?;
             let filters = search_filters_from_args(&filters, repo_filter)?;
@@ -3870,7 +3933,9 @@ fn run() -> Result<()> {
                     attach_cli_shard_retry_requests_with_tool(
                         &mut plans, "search", &index_dir, &filters,
                     );
-                    if summary {
+                    if advice {
+                        batch.push(advice_shard_query_plan_batch_result(query, &plans));
+                    } else if summary {
                         batch.push(compact_shard_query_plan_batch_result(query, &plans));
                     } else {
                         batch.push(serde_json::to_value(shard_query_plan_batch_result(
@@ -3890,7 +3955,9 @@ fn run() -> Result<()> {
                         &index_path,
                         &filters,
                     );
-                    if summary {
+                    if advice {
+                        batch.push(advice_query_plan_batch_result(query, &plan));
+                    } else if summary {
                         batch.push(compact_query_plan_batch_result(query, &plan));
                     } else {
                         batch.push(serde_json::to_value(query_plan_batch_result(query, plan))?);
@@ -3908,7 +3975,9 @@ fn run() -> Result<()> {
                         &index.root,
                         &filters,
                     );
-                    if summary {
+                    if advice {
+                        batch.push(advice_query_plan_batch_result(query, &plan));
+                    } else if summary {
                         batch.push(compact_query_plan_batch_result(query, &plan));
                     } else {
                         batch.push(serde_json::to_value(query_plan_batch_result(query, plan))?);

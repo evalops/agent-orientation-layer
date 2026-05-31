@@ -60,7 +60,8 @@ The snippet should tell agents:
 - When `next_action` is present, run `next_action.request` first; it chooses
   between refresh, read, retry, map, and empty-result query-plan follow-ups.
 - Use `query_plan_summary` on `search_auto` / `search_auto_batch` and `summary`
-  on plan batch items before parsing full nested query plans.
+  on plan batch items before parsing full nested query plans. For wrappers that
+  only need the next retry, request `advice:true` on plan tools instead.
 - When opening context manually from a line inside a definition, pass
   `scope:"symbol"` on `read_range` or `read_ranges` so the returned window
   starts from the nearest enclosing function, class, or type definition. Check
