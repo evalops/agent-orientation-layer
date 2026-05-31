@@ -45,6 +45,7 @@ pub fn parse_query(input: &str) -> ParsedQuery {
     infer_leading_pytest_node_id_term(&mut terms, &mut filters, explicit_content_terms);
     infer_js_test_command_path_term(&mut terms, &mut filters, explicit_content_terms);
     infer_package_script_command_symbol_term(&mut terms, &mut filters, explicit_content_terms);
+    infer_task_file_command_symbol_term(&mut terms, &mut filters, explicit_content_terms);
     infer_cargo_test_command_symbol_term(&mut terms, &mut filters, explicit_content_terms);
     infer_go_test_run_command_symbol_term(&mut terms, &mut filters, explicit_content_terms);
     infer_jvm_test_command_symbol_term(&mut terms, &mut filters, explicit_content_terms);
@@ -823,6 +824,113 @@ fn is_package_script_command_flag_term(value: &str) -> bool {
         value,
         "" | "watch" | "silent" | "if-present" | "ignore-scripts" | "frozen-lockfile"
     )
+}
+
+fn infer_task_file_command_symbol_term(
+    terms: &mut Vec<String>,
+    filters: &mut SearchFilters,
+    explicit_content_terms: bool,
+) {
+    if explicit_content_terms
+        || terms.len() < 2
+        || filters.file.is_some()
+        || filters.path.is_some()
+        || filters.symbol.is_some()
+    {
+        return;
+    }
+
+    let mut saw_runner = false;
+    let mut targets = Vec::new();
+    for term in terms.iter() {
+        let term = trim_location_token_wrappers(term);
+        let lower = term.to_ascii_lowercase();
+        if is_task_file_runner(&lower) {
+            saw_runner = true;
+            continue;
+        }
+        if is_task_file_assignment(term) {
+            continue;
+        }
+        let Some(target) = task_file_target(term) else {
+            return;
+        };
+        targets.push(target);
+    }
+
+    for term in filters.exclude_content.iter() {
+        let term = trim_location_token_wrappers(term);
+        if !is_task_file_command_flag_term(term) {
+            return;
+        }
+    }
+
+    let [target] = targets.as_slice() else {
+        return;
+    };
+    if !saw_runner {
+        return;
+    }
+
+    filters.symbol = Some(target.clone());
+    filters.symbol_kind = Some("target".to_string());
+    filters.exclude_content.clear();
+    terms.clear();
+    filters.require_all = false;
+}
+
+fn is_task_file_runner(value: &str) -> bool {
+    matches!(value.trim_start_matches("./"), "make" | "gmake" | "just")
+}
+
+fn task_file_target(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.contains('=')
+        || value.contains('%')
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return None;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn is_task_file_assignment(value: &str) -> bool {
+    let Some((name, value)) = value.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !value.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn is_task_file_command_flag_term(value: &str) -> bool {
+    let value = value.trim_start_matches('-');
+    if value.is_empty() {
+        return true;
+    }
+    matches!(
+        value,
+        "B" | "k"
+            | "n"
+            | "s"
+            | "silent"
+            | "dry-run"
+            | "always-make"
+            | "keep-going"
+            | "no-print-directory"
+    ) || value.starts_with('j')
+        || value.starts_with("load-average")
 }
 
 fn infer_cargo_test_command_symbol_term(
@@ -2974,6 +3082,44 @@ mod tests {
         let bun_builtin_test_command = parse_query("bun test");
         assert_eq!(bun_builtin_test_command.filters.symbol, None);
         assert!(!bun_builtin_test_command.terms.is_empty());
+
+        let make_target_command = parse_query("make -j4 deploy ENV=prod");
+        assert!(make_target_command.terms.is_empty());
+        assert_eq!(
+            make_target_command.filters.symbol.as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            make_target_command.filters.symbol_kind.as_deref(),
+            Some("target")
+        );
+        assert!(make_target_command.filters.exclude_content.is_empty());
+
+        let just_target_command = parse_query("just release target=prod");
+        assert!(just_target_command.terms.is_empty());
+        assert_eq!(
+            just_target_command.filters.symbol.as_deref(),
+            Some("release")
+        );
+        assert_eq!(
+            just_target_command.filters.symbol_kind.as_deref(),
+            Some("target")
+        );
+
+        let just_hyphenated_assignment = parse_query("just release build-type=debug");
+        assert!(just_hyphenated_assignment.terms.is_empty());
+        assert_eq!(
+            just_hyphenated_assignment.filters.symbol.as_deref(),
+            Some("release")
+        );
+        assert_eq!(
+            just_hyphenated_assignment.filters.symbol_kind.as_deref(),
+            Some("target")
+        );
+
+        let make_without_target = parse_query("make -j4");
+        assert_eq!(make_without_target.filters.symbol, None);
+        assert!(!make_without_target.terms.is_empty());
 
         let cargo_test_command = parse_query("cargo test parser_accepts_locations");
         assert!(cargo_test_command.terms.is_empty());

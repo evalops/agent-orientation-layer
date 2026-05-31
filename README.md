@@ -112,7 +112,9 @@ the Go test function within that package. Maven and Gradle selectors such as
 `./gradlew test --tests com.example.GatewayTest.routesPayment` resolve to the
 matching JVM test method. Package script commands such as `npm run typecheck`,
 `yarn run build:prod`, and shortcut forms like `pnpm lint` resolve to
-package.json scripts. Language filters include common shorthands such as
+package.json scripts. Task commands such as `make deploy` and
+`just release target=prod` resolve to Makefile and Justfile targets.
+Language filters include common shorthands such as
 `lang:rs`, `lang:ts`, `lang:cpp`, `lang:csharp`, `lang:shell`,
 `lang:makefile`, and `lang:justfile`. `kind:target` and `recipe:name` can jump
 to Makefile targets,

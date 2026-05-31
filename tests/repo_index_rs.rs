@@ -778,6 +778,16 @@ release target='prod':
     assert_eq!(fallback[0].path, "Makefile");
     assert!(fallback[0].reason.contains("symbol:deploy"));
 
+    let command_fallback = search_repo_fast_filtered(
+        repo.path(),
+        "make -j4 deploy ENV=prod",
+        5,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(command_fallback[0].path, "Makefile");
+    assert!(command_fallback[0].reason.contains("symbol:deploy"));
+
     let indexed = FastIndex::build(repo.path()).unwrap();
     assert_symbol(&indexed.find_symbol("release", 10)[0], "Justfile", "target");
     let indexed_results = indexed
@@ -785,6 +795,12 @@ release target='prod':
         .unwrap();
     assert_eq!(indexed_results[0].path, "Makefile");
     assert!(indexed_results[0].reason.contains("symbol:clean-build"));
+
+    let indexed_command_results = indexed
+        .search_filtered("just release target=prod", 5, &Default::default())
+        .unwrap();
+    assert_eq!(indexed_command_results[0].path, "Justfile");
+    assert!(indexed_command_results[0].reason.contains("symbol:release"));
 }
 
 #[test]
