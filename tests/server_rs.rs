@@ -8665,7 +8665,7 @@ fn runtime_search_auto_scopes_warmed_shards_to_client_cwd() {
     );
     assert_eq!(
         value["summary"]["shard_route"]["selected_shards"],
-        serde_json::json!(2)
+        serde_json::json!(1)
     );
     assert_eq!(
         value["summary"]["shard_route"]["routed"],
@@ -9406,7 +9406,7 @@ fn runtime_orientation_tools_scope_warmed_shards_to_client_cwd() {
     let search_batch = search_batch.result.unwrap();
     assert_eq!(
         search_batch[0]["summary"]["shard_route"]["status"],
-        serde_json::json!("routed_all_shards")
+        serde_json::json!("routed")
     );
     assert_eq!(
         search_batch[0]["summary"]["shard_route"]["total_shards"],
@@ -9414,7 +9414,7 @@ fn runtime_orientation_tools_scope_warmed_shards_to_client_cwd() {
     );
     assert_eq!(
         search_batch[0]["summary"]["shard_route"]["selected_shards"],
-        serde_json::json!(2)
+        serde_json::json!(1)
     );
     assert!(
         search_batch[1]["summary"]["shard_route"]["selected_shards"]

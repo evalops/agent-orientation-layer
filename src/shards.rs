@@ -2920,11 +2920,10 @@ fn shard_route_stats(
     };
     let selected_shards = candidate_ids
         .into_iter()
-        .filter(|id| {
-            route
-                .shards
-                .get(*id as usize)
-                .is_some_and(|shard| shard_route_filters_may_match(shard, filters))
+        .filter_map(|id| route.shards.get(id as usize))
+        .filter(|shard| {
+            shard_route_filters_may_match(shard, filters)
+                && !shard_search_scopes(&(*shard).clone().into_shard(), filters).is_empty()
         })
         .count();
     let status = if selected_shards == total_shards {
@@ -3005,6 +3004,7 @@ pub(crate) fn shard_route_selection(
         .filter_map(|id| route.shards.get(id as usize).cloned())
         .filter(|shard| shard_route_filters_may_match(shard, filters))
         .map(ShardRouteEntry::into_shard)
+        .filter(|shard| !shard_search_scopes(shard, filters).is_empty())
         .collect::<Vec<_>>();
     Ok(Some(ShardRouteSelection {
         shards,
@@ -3014,7 +3014,13 @@ pub(crate) fn shard_route_selection(
 }
 
 fn shard_route_filter_only_selectable(filters: &SearchFilters) -> bool {
-    filters.symbol_kind.is_some()
+    filters.repo.is_some()
+        || filters.branch.is_some()
+        || filters.origin.is_some()
+        || !filters.exclude_repo.is_empty()
+        || !filters.exclude_branch.is_empty()
+        || !filters.exclude_origin.is_empty()
+        || filters.symbol_kind.is_some()
         || filters.language.is_some()
         || filters.extension.is_some()
         || filters.test.is_some()
@@ -4350,6 +4356,42 @@ mod tests {
                 .map(|shard| shard.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["auth"]
+        );
+        let repo_scoped_selection = shard_route_selection(
+            dir.path(),
+            "",
+            &SearchFilters {
+                repo: Some("billing".to_string()),
+                ..SearchFilters::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            repo_scoped_selection
+                .shards
+                .iter()
+                .map(|shard| shard.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["billing"]
+        );
+        let repo_scoped_stats = shard_query_route_stats(
+            dir.path(),
+            "",
+            &SearchFilters {
+                repo: Some("billing".to_string()),
+                ..SearchFilters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo_scoped_stats,
+            ShardRouteStats {
+                status: "filter_route".to_string(),
+                routed: true,
+                total_shards: 2,
+                selected_shards: 1,
+            }
         );
         assert!(route.shard_ids.len() < 16);
 
