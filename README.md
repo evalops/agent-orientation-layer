@@ -200,6 +200,7 @@ bazel run //:ci_full_test
 bazel run //:ci_perf_gates
 ORIENT_WIDE_SHARDS=0 bazel run //:ci_wide_perf
 ORIENT_AGENT_ROOT=/path/to/projects tools/ci/orient_agent_query_perf.sh
+ORIENT_DAEMON_CWD_ROOT=/path/to/projects ORIENT_DAEMON_CWD=/path/to/current-checkout tools/ci/orient_daemon_cwd_perf.sh
 orient bench-daemon --addr 127.0.0.1:8796 --cwd . --concurrency 10 --request-timeout-ms 30000 "symbol:SessionManager token"
 ```
 
@@ -214,7 +215,8 @@ slowest query. Use `--fail-p95-ms` for hard gates and `--baseline` /
 `shard_route`, visible hit shards, and selected shards without visible hits, so
 slow queries show whether routing or ranking is wasting fanout. `bench-daemon` uses
 concurrent JSON-lines `search_auto` requests to measure shared-daemon queueing
-under local multi-agent load.
+under local multi-agent load. `orient_daemon_cwd_perf.sh` wraps that daemon flow
+with shard warmup and checkout-scoped `cwd` requests.
 
 ## Docs
 

@@ -99,3 +99,8 @@ sh_binary(
     name = "ci_wide_perf",
     srcs = ["tools/ci/orient_wide_perf.sh"],
 )
+
+sh_binary(
+    name = "ci_daemon_cwd_perf",
+    srcs = ["tools/ci/orient_daemon_cwd_perf.sh"],
+)

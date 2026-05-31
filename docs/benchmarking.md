@@ -11,6 +11,9 @@ Orient has three benchmark layers:
 - `orient bench-daemon` is the shared-daemon concurrency benchmark. It sends
   simultaneous JSON-lines `search_auto` requests to one daemon so a local
   multi-agent setup can check queueing and tail latency.
+- `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
+  warms shards, scopes requests through a checkout `cwd`, and gates repeated
+  concurrent `search_auto` latency for the path coding agents normally use.
 
 Run the local agent benchmark with:
 
@@ -25,6 +28,19 @@ Use `ORIENT_AGENT_QUERY_FILE=/path/to/queries.txt` to replace the default query
 set. Blank lines and `#` comments are ignored. Use
 `ORIENT_AGENT_REBUILD_SHARDS=0` to reuse an existing shard directory, and set
 `ORIENT_AGENT_FALLBACK=0` when only cached shard latency matters.
+
+Run the local shared-daemon benchmark with:
+
+```bash
+ORIENT_DAEMON_CWD_ROOT=/path/to/projects \
+ORIENT_DAEMON_CWD=/path/to/projects/current-checkout \
+ORIENT_DAEMON_CWD_OUTPUT_DIR=/tmp/orient-daemon-cwd-shards \
+tools/ci/orient_daemon_cwd_perf.sh
+```
+
+Set `ORIENT_DAEMON_CWD_REBUILD_SHARDS=1` to rebuild shards, or leave it unset
+to reuse an existing shard directory when possible. The default p95 gate is
+300ms and can be changed with `ORIENT_DAEMON_CWD_P95_MS`.
 
 For a running shared daemon, check concurrent local-agent search latency with:
 
