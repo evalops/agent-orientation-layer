@@ -22,9 +22,9 @@ Orient has these benchmark surfaces:
   marker files between waves, so stale-refresh and fallback-cliff behavior are
   visible under load.
 - `orient bench-daemon-contend` runs many independent client loops with optional
-  per-client `cwd` scopes, jitter, mixed search/read operations, and wall-clock
-  throughput reporting. This is the closest built-in shape to several local
-  coding agents sharing one daemon.
+  per-client `cwd` scopes, jitter, mixed search/read operations, wall-clock
+  throughput, and daemon RSS reporting. This is the closest built-in shape to
+  several local coding agents sharing one daemon.
 - `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
   warms shards, scopes requests through a checkout `cwd`, and gates repeated
   concurrent `search_auto` latency for the path coding agents normally use.
@@ -95,7 +95,9 @@ tools/ci/orient_daemon_contention_perf.sh
 Use `ORIENT_DAEMON_CONTEND_MODE=cold` to measure first-touch behavior, `warm`
 to measure pinned active repos, or `both` to run the pair. Query and range files
 can be supplied with `ORIENT_DAEMON_CONTEND_QUERY_FILE` and
-`ORIENT_DAEMON_CONTEND_RANGE_FILE`.
+`ORIENT_DAEMON_CONTEND_RANGE_FILE`. Daemon benchmark summaries include
+`daemon_rss_start_bytes`, `daemon_rss_end_bytes`, and `daemon_rss_max_bytes`
+when the connected daemon exposes process RSS in `daemon_status`.
 
 ## Shared Daemon Matrix
 

@@ -7364,6 +7364,11 @@ fn runtime_warms_index_by_tool_request() {
             .unwrap()
             > 0
     );
+    #[cfg(unix)]
+    assert!(
+        result["footprint"]["process_rss_bytes"].as_u64().unwrap() > 0,
+        "{result}"
+    );
 }
 
 #[test]
@@ -12695,6 +12700,27 @@ fn tcp_daemon_contention_bench_reports_multi_client_search_and_read_latency() {
         report["summary"]["first_wave_max_ms"].as_f64().unwrap() >= 0.0,
         "{report}"
     );
+    #[cfg(unix)]
+    {
+        assert!(
+            report["summary"]["daemon_rss_start_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "{report}"
+        );
+        assert!(
+            report["summary"]["daemon_rss_end_bytes"].as_u64().unwrap() > 0,
+            "{report}"
+        );
+        assert!(
+            report["summary"]["daemon_rss_max_bytes"].as_u64().unwrap()
+                >= report["summary"]["daemon_rss_start_bytes"]
+                    .as_u64()
+                    .unwrap(),
+            "{report}"
+        );
+    }
     let labels = report["queries"]
         .as_array()
         .unwrap()

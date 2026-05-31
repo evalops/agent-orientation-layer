@@ -11141,7 +11141,7 @@ fn argument_value<'a>(arguments: &'a Value, name: &str) -> Option<&'a Value> {
 }
 
 fn daemon_footprint_summary(index_details: &[Value], shard_manifest_details: &[Value]) -> Value {
-    json!({
+    let mut footprint = json!({
         "loaded_indexes": index_details.len(),
         "loaded_files": sum_u64_field(index_details, "files"),
         "loaded_index_bytes": sum_u64_field(index_details, "index_bytes"),
@@ -11163,7 +11163,40 @@ fn daemon_footprint_summary(index_details: &[Value], shard_manifest_details: &[V
         "known_shard_line_offset_bytes": sum_u64_field(shard_manifest_details, "line_offset_bytes"),
         "manifest_disk_missing": count_bool_field(shard_manifest_details, "manifest_disk_missing"),
         "manifest_disk_changed": count_bool_field(shard_manifest_details, "manifest_disk_changed"),
+    });
+    if let Some(rss_bytes) = current_process_rss_bytes() {
+        footprint["process_rss_bytes"] = json!(rss_bytes);
+    }
+    footprint
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?.trim();
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some(kib.saturating_mul(1024))
     })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn current_process_rss_bytes() -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let kib = text.trim().parse::<u64>().ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
+#[cfg(not(unix))]
+fn current_process_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn sum_u64_field(items: &[Value], field: &str) -> u64 {

@@ -58,6 +58,8 @@ Useful counters:
   file/path scopes, and simple long dependency/import scopes can prune routed
   shard candidates before cold index loads.
 - `largest_shards`: largest shard indexes in a shard directory
+- `process_rss_bytes`: current daemon resident memory, when the platform can
+  report it
 
 `manifest.json` is intentionally slim and keeps repo identity, aliases, git
 metadata, and index filenames. Dense sketches and route filters live in binary

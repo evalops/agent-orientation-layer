@@ -1865,6 +1865,12 @@ struct BenchSummary {
     first_wave_p95_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     first_wave_max_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daemon_rss_start_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daemon_rss_end_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daemon_rss_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8625,6 +8631,7 @@ fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
     let runs = config.runs.max(1);
     let concurrency = config.concurrency.max(1);
     let mut query_reports = Vec::new();
+    let rss_start = daemon_rss_bytes_for_target(&config.target);
 
     for query in &config.queries {
         for _ in 0..config.warmup {
@@ -8659,20 +8666,27 @@ fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
         query_reports.push(summarize_query(query, result_count, samples_ms, None, None));
     }
 
-    Ok(bench_report(
+    let mut report = bench_report(
         "daemon".to_string(),
         runs,
         config.warmup,
         config.limit,
         Some(concurrency),
         query_reports,
-    ))
+    );
+    annotate_daemon_rss(
+        &mut report,
+        rss_start,
+        daemon_rss_bytes_for_target(&config.target),
+    );
+    Ok(report)
 }
 
 fn bench_daemon_read(config: DaemonReadBenchConfig) -> Result<BenchReport> {
     let runs = config.runs.max(1);
     let concurrency = config.concurrency.max(1);
     let mut query_reports = Vec::new();
+    let rss_start = daemon_rss_bytes_for_target(&config.target);
 
     for range in &config.ranges {
         for _ in 0..config.warmup {
@@ -8709,19 +8723,26 @@ fn bench_daemon_read(config: DaemonReadBenchConfig) -> Result<BenchReport> {
         ));
     }
 
-    Ok(bench_report(
+    let mut report = bench_report(
         "daemon_read_range".to_string(),
         runs,
         config.warmup,
         1,
         Some(concurrency),
         query_reports,
-    ))
+    );
+    annotate_daemon_rss(
+        &mut report,
+        rss_start,
+        daemon_rss_bytes_for_target(&config.target),
+    );
+    Ok(report)
 }
 
 fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
     let runs = config.runs.max(1);
     let concurrency = config.concurrency.max(1);
+    let rss_start = daemon_rss_bytes_for_target(&config.target);
     let scheduled_samples = runs * concurrency;
     if scheduled_samples < config.operations.len() {
         bail!(
@@ -8771,18 +8792,25 @@ fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
         .map(|(label, accumulator)| summarize_accumulated_query(&label, accumulator))
         .collect();
 
-    Ok(bench_report(
+    let mut report = bench_report(
         "daemon_mix".to_string(),
         runs,
         config.warmup,
         config.limit,
         Some(concurrency),
         query_reports,
-    ))
+    );
+    annotate_daemon_rss(
+        &mut report,
+        rss_start,
+        daemon_rss_bytes_for_target(&config.target),
+    );
+    Ok(report)
 }
 
 fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
     let started = Instant::now();
+    let rss_start = daemon_rss_bytes_for_target(&config.target);
     let runs = config.runs.max(1);
     let concurrency = config.concurrency.max(1);
     let churn_files = config.churn_files.max(1);
@@ -8884,6 +8912,11 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
     report.summary.baseline_max_p95_ms = baseline_max_p95_ms;
     report.summary.refresh_overhead_max_p95_ms = baseline_max_p95_ms
         .map(|baseline| round_ms((report.summary.max_p95_ms - baseline).max(0.0)));
+    annotate_daemon_rss(
+        &mut report,
+        rss_start,
+        daemon_rss_bytes_for_target(&config.target),
+    );
     Ok(report)
 }
 
@@ -8908,6 +8941,7 @@ fn bench_daemon_contend(config: DaemonContentionBenchConfig) -> Result<BenchRepo
         bail!("daemon contention benchmark needs at least one operation");
     }
     let mut samples_by_operation = BTreeMap::<String, BenchQueryAccumulator>::new();
+    let rss_start = daemon_rss_bytes_for_target(&config.target);
     let started = Instant::now();
     let samples = run_daemon_contention_clients(&config, clients, runs, config.warmup)?;
     let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -8935,7 +8969,31 @@ fn bench_daemon_contend(config: DaemonContentionBenchConfig) -> Result<BenchRepo
         report.summary.first_wave_p95_ms = Some(p95_ms);
         report.summary.first_wave_max_ms = Some(max_ms);
     }
+    annotate_daemon_rss(
+        &mut report,
+        rss_start,
+        daemon_rss_bytes_for_target(&config.target),
+    );
     Ok(report)
+}
+
+fn daemon_rss_bytes_for_target(target: &DaemonTarget) -> Option<u64> {
+    daemon_status_for_target(target)
+        .ok()
+        .and_then(|status| daemon_rss_bytes_from_status(&status))
+}
+
+fn daemon_rss_bytes_from_status(status: &Value) -> Option<u64> {
+    status
+        .get("footprint")
+        .and_then(|footprint| footprint.get("process_rss_bytes"))
+        .and_then(Value::as_u64)
+}
+
+fn annotate_daemon_rss(report: &mut BenchReport, start: Option<u64>, end: Option<u64>) {
+    report.summary.daemon_rss_start_bytes = start;
+    report.summary.daemon_rss_end_bytes = end;
+    report.summary.daemon_rss_max_bytes = start.into_iter().chain(end).max();
 }
 
 fn contention_first_wave_stats(samples: &[DaemonMixBenchSample]) -> Option<(f64, f64)> {
@@ -9641,6 +9699,9 @@ fn summarize_bench_report(queries: &[QueryBench]) -> BenchSummary {
         ops_per_sec: None,
         first_wave_p95_ms: None,
         first_wave_max_ms: None,
+        daemon_rss_start_bytes: None,
+        daemon_rss_end_bytes: None,
+        daemon_rss_max_bytes: None,
     }
 }
 
