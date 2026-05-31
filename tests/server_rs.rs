@@ -12236,6 +12236,113 @@ fn tcp_daemon_mix_bench_reports_concurrent_search_and_read_latency() {
 }
 
 #[test]
+fn tcp_daemon_contention_bench_reports_multi_client_search_and_read_latency() {
+    let binary = assert_cmd::cargo::cargo_bin("orient");
+    let workspace = tempfile::tempdir().unwrap();
+    let repo_a = workspace.path().join("agent-a");
+    let repo_b = workspace.path().join("agent-b");
+    let shards = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo_a.join(".git")).unwrap();
+    fs::create_dir_all(repo_b.join(".git")).unwrap();
+    write(
+        &repo_a.join("src/auth.rs"),
+        "pub fn issue_alpha_token() -> &'static str { \"alpha\" }\n",
+    );
+    write(
+        &repo_b.join("src/auth.rs"),
+        "pub fn issue_beta_token() -> &'static str { \"beta\" }\n",
+    );
+
+    let shard_output = Command::new(&binary)
+        .args([
+            "ensure-shards",
+            "--discover-root",
+            workspace.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        shard_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&shard_output.stdout),
+        String::from_utf8_lossy(&shard_output.stderr)
+    );
+
+    let mut child = Command::new(&binary)
+        .args([
+            "serve-tcp",
+            "--addr",
+            "127.0.0.1:0",
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut startup_reader = BufReader::new(stdout);
+    let mut startup = String::new();
+    startup_reader.read_line(&mut startup).unwrap();
+    let startup_json: serde_json::Value = serde_json::from_str(&startup).unwrap();
+    let addr = startup_json["addr"].as_str().unwrap();
+
+    let output = Command::new(&binary)
+        .args([
+            "bench-daemon-contend",
+            "--addr",
+            addr,
+            "--cwd",
+            repo_a.to_str().unwrap(),
+            "--cwd",
+            repo_b.to_str().unwrap(),
+            "--clients",
+            "4",
+            "--runs",
+            "3",
+            "--warmup",
+            "1",
+            "--jitter-ms",
+            "0",
+            "--request-timeout-ms",
+            "5000",
+            "--query",
+            "issue token",
+            "--range",
+            "src/auth.rs:1:1",
+        ])
+        .output()
+        .unwrap();
+
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], serde_json::json!("daemon_contention"));
+    assert_eq!(report["concurrency"], serde_json::json!(4));
+    assert_eq!(report["summary"]["query_count"], serde_json::json!(2));
+    assert_eq!(report["summary"]["sample_count"], serde_json::json!(12));
+    assert!(report["summary"]["ops_per_sec"].as_f64().unwrap() > 0.0);
+    assert!(report["summary"]["wall_ms"].as_f64().unwrap() >= 0.0);
+    let labels = report["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|query| query["query"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"search:issue token"), "{report}");
+    assert!(labels.contains(&"read:src/auth.rs:1:1"), "{report}");
+}
+
+#[test]
 fn tcp_daemon_churn_bench_reports_refresh_metrics_without_fallback() {
     let binary = assert_cmd::cargo::cargo_bin("orient");
     let repo = tempfile::tempdir().unwrap();

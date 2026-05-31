@@ -18,6 +18,10 @@ Orient has four benchmark layers:
 - `orient bench-daemon-churn` checks the same mixed path while editing small
   marker files between waves, so stale-refresh and fallback-cliff behavior are
   visible under load.
+- `orient bench-daemon-contend` runs many independent client loops with optional
+  per-client `cwd` scopes, jitter, mixed search/read operations, and wall-clock
+  throughput reporting. This is the closest built-in shape to several local
+  coding agents sharing one daemon.
 - `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
   warms shards, scopes requests through a checkout `cwd`, and gates repeated
   concurrent `search_auto` latency for the path coding agents normally use.
@@ -132,6 +136,31 @@ unless `--keep-churn-files` is set. Reports include `fallback_count`,
 `churn_writes`, `baseline_max_p95_ms`, and `refresh_overhead_max_p95_ms`.
 `fallback_rate` is measured over search samples. The baseline waves run before
 the edits so refresh cost is visible instead of being hidden inside one p95.
+
+Check shared-daemon contention with:
+
+```bash
+orient bench-daemon-contend \
+  --addr 127.0.0.1:8796 \
+  --cwd /path/to/repo-a \
+  --cwd /path/to/repo-b \
+  --clients 10 \
+  --runs 40 \
+  --warmup 5 \
+  --jitter-ms 50 \
+  --request-timeout-ms 30000 \
+  --query "symbol:SessionManager token" \
+  --query "file:Cargo.toml" \
+  --range src/main.rs:1:40
+```
+
+`bench-daemon-contend` assigns clients round-robin across the supplied `--cwd`
+values, chooses search/read operations round-robin per client, and sleeps a
+deterministic jitter between operations. It reports `sample_count` as
+`clients * runs`, keeps per-operation p50/p95/p99/max samples, and adds
+`wall_ms` plus `ops_per_sec` to the summary. Use it when several local agent
+processes share one daemon and you care about contention rather than a single
+synchronized wave.
 
 The default query set intentionally mixes:
 

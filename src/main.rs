@@ -1079,6 +1079,41 @@ enum Commands {
         #[arg(long)]
         fail_fallback_rate: Option<f64>,
     },
+    BenchDaemonContend {
+        #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
+        socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "TCP daemon address; falls back to ORIENT_ADDR or 127.0.0.1:8796"
+        )]
+        addr: Option<String>,
+        #[arg(long = "cwd")]
+        cwd_args: Vec<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        clients: usize,
+        #[arg(long, default_value_t = 20)]
+        runs: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS)]
+        request_timeout_ms: u64,
+        #[arg(long, default_value_t = 50)]
+        jitter_ms: u64,
+        #[arg(long = "repo-filter")]
+        repo_filter: Option<String>,
+        #[command(flatten)]
+        filters: CommonSearchArgs,
+        #[arg(long = "query", value_name = "QUERY")]
+        query_args: Vec<String>,
+        #[arg(long = "range", value_name = "PATH:START:LINES[:SCOPE]")]
+        range_args: Vec<CliRangeSpec>,
+        #[arg(long)]
+        fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_fallback_rate: Option<f64>,
+    },
     ToolManifest {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
         format: String,
@@ -1737,6 +1772,10 @@ struct BenchSummary {
     baseline_max_p95_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_overhead_max_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wall_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ops_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6056,6 +6095,45 @@ fn run() -> Result<()> {
                 fail_bench_fallback_rate(&report, threshold)?;
             }
         }
+        Commands::BenchDaemonContend {
+            socket,
+            addr,
+            cwd_args,
+            clients,
+            runs,
+            warmup,
+            limit,
+            request_timeout_ms,
+            jitter_ms,
+            repo_filter,
+            filters,
+            query_args,
+            range_args,
+            fail_p95_ms,
+            fail_fallback_rate,
+        } => {
+            let filters = search_filters_from_args(&filters, repo_filter)?;
+            let operations = cli_benchmark_mix_operations(query_args, range_args)?;
+            let report = bench_daemon_contend(DaemonContentionBenchConfig {
+                target: resolve_daemon_target(socket, addr),
+                cwds: cwd_args,
+                clients,
+                runs,
+                warmup,
+                limit,
+                request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
+                jitter: Duration::from_millis(jitter_ms),
+                filters,
+                operations,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            if let Some(threshold) = fail_p95_ms {
+                fail_slow_bench_queries(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_fallback_rate {
+                fail_bench_fallback_rate(&report, threshold)?;
+            }
+        }
         Commands::ToolManifest { format: _format } => {
             println!("{}", serde_json::to_string(&tool_manifest())?);
         }
@@ -7983,6 +8061,19 @@ struct DaemonChurnBenchConfig {
     cleanup: bool,
 }
 
+struct DaemonContentionBenchConfig {
+    target: DaemonTarget,
+    cwds: Vec<PathBuf>,
+    clients: usize,
+    runs: usize,
+    warmup: usize,
+    limit: usize,
+    request_timeout: Duration,
+    jitter: Duration,
+    filters: SearchFilters,
+    operations: Vec<DaemonMixOperation>,
+}
+
 #[derive(Debug, Clone)]
 enum DaemonMixOperation {
     Search(String),
@@ -8395,6 +8486,38 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
     Ok(report)
 }
 
+fn bench_daemon_contend(config: DaemonContentionBenchConfig) -> Result<BenchReport> {
+    let runs = config.runs.max(1);
+    let clients = config.clients.max(1);
+    if config.operations.is_empty() {
+        bail!("daemon contention benchmark needs at least one operation");
+    }
+    let mut samples_by_operation = BTreeMap::<String, BenchQueryAccumulator>::new();
+    let started = Instant::now();
+    let samples = run_daemon_contention_clients(&config, clients, runs, config.warmup)?;
+    let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    accumulate_daemon_mix_wave(&mut samples_by_operation, samples);
+    let query_reports = samples_by_operation
+        .into_iter()
+        .map(|(label, accumulator)| summarize_accumulated_query(&label, accumulator))
+        .collect();
+    let mut report = bench_report(
+        "daemon_contention".to_string(),
+        runs,
+        config.warmup,
+        config.limit,
+        Some(clients),
+        query_reports,
+    );
+    report.summary.wall_ms = Some(round_ms(wall_ms));
+    if wall_ms > 0.0 {
+        report.summary.ops_per_sec = Some(round_ms(
+            report.summary.sample_count as f64 / (wall_ms / 1_000.0),
+        ));
+    }
+    Ok(report)
+}
+
 fn accumulate_daemon_mix_wave(
     samples_by_operation: &mut BTreeMap<String, BenchQueryAccumulator>,
     wave: Vec<DaemonMixBenchSample>,
@@ -8588,6 +8711,107 @@ fn run_daemon_mix_wave(
         samples.push(sample);
     }
     Ok(samples)
+}
+
+fn run_daemon_contention_clients(
+    config: &DaemonContentionBenchConfig,
+    clients: usize,
+    runs: usize,
+    warmup: usize,
+) -> Result<Vec<DaemonMixBenchSample>> {
+    let barrier = Arc::new(Barrier::new(clients));
+    let mut handles = Vec::with_capacity(clients);
+    for client_index in 0..clients {
+        let target = config.target.clone();
+        let cwd = contention_client_cwd(&config.cwds, client_index);
+        let operations = config.operations.clone();
+        let filters = config.filters.clone();
+        let barrier = Arc::clone(&barrier);
+        let limit = config.limit;
+        let request_timeout = config.request_timeout;
+        let jitter = config.jitter;
+        handles.push(thread::spawn(
+            move || -> Result<Vec<DaemonMixBenchSample>> {
+                barrier.wait();
+                let mut samples = Vec::with_capacity(runs);
+                let total_iterations = warmup + runs;
+                for iteration in 0..total_iterations {
+                    sleep_daemon_contention_jitter(client_index, iteration, jitter);
+                    let operation_index = (client_index + iteration) % operations.len();
+                    let operation = operations[operation_index].clone();
+                    let started = Instant::now();
+                    let (label, result_count, diagnostics) = match operation {
+                        DaemonMixOperation::Search(query) => {
+                            let result = run_daemon_search_once(
+                                &target,
+                                cwd.as_deref(),
+                                &query,
+                                limit,
+                                &filters,
+                                DaemonSearchFlags::default(),
+                                request_timeout,
+                            )?;
+                            (
+                                daemon_mix_search_label(&query),
+                                daemon_search_result_count(&result),
+                                daemon_search_sample_diagnostics(&result),
+                            )
+                        }
+                        DaemonMixOperation::Read(range) => {
+                            let result = run_daemon_read_once(
+                                &target,
+                                cwd.as_deref(),
+                                &range,
+                                request_timeout,
+                            )?;
+                            (
+                                daemon_mix_read_label(&range),
+                                daemon_read_line_count(&result),
+                                BenchSampleDiagnostics::default(),
+                            )
+                        }
+                    };
+                    if iteration >= warmup {
+                        samples.push(DaemonMixBenchSample {
+                            label,
+                            result_count,
+                            diagnostics,
+                            elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                        });
+                    }
+                }
+                Ok(samples)
+            },
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(clients * runs);
+    for handle in handles {
+        let mut client_samples = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("daemon contention benchmark worker panicked"))??;
+        samples.append(&mut client_samples);
+    }
+    Ok(samples)
+}
+
+fn contention_client_cwd(cwds: &[PathBuf], client_index: usize) -> Option<PathBuf> {
+    if cwds.is_empty() {
+        None
+    } else {
+        Some(cwds[client_index % cwds.len()].clone())
+    }
+}
+
+fn sleep_daemon_contention_jitter(client_index: usize, iteration: usize, jitter: Duration) {
+    let max_ms = jitter.as_millis() as u64;
+    if max_ms == 0 {
+        return;
+    }
+    let sleep_ms = ((client_index as u64 * 31) + (iteration as u64 * 17)) % (max_ms + 1);
+    if sleep_ms > 0 {
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
 }
 
 fn run_daemon_search_once(
@@ -8947,6 +9171,8 @@ fn summarize_bench_report(queries: &[QueryBench]) -> BenchSummary {
         churn_writes: None,
         baseline_max_p95_ms: None,
         refresh_overhead_max_p95_ms: None,
+        wall_ms: None,
+        ops_per_sec: None,
     }
 }
 
