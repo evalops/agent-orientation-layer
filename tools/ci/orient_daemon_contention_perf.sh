@@ -31,6 +31,7 @@ p95_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P95_MS:-}"
 p99_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P99_MS:-}"
 fallback_rate_threshold="${ORIENT_DAEMON_CONTEND_FAIL_FALLBACK_RATE:-}"
 daemon_rss_threshold_mb="${ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_MB:-}"
+daemon_rss_source_ratio_threshold="${ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_SOURCE_RATIO:-}"
 
 if [[ ! -d "${root}" ]]; then
   if [[ "${ORIENT_DAEMON_CONTEND_REQUIRE_ROOT:-0}" == "1" ]]; then
@@ -130,6 +131,9 @@ if [[ -n "${fallback_rate_threshold}" ]]; then
 fi
 if [[ -n "${daemon_rss_threshold_mb}" ]]; then
   gate_args+=(--fail-daemon-rss-mb "${daemon_rss_threshold_mb}")
+fi
+if [[ -n "${daemon_rss_source_ratio_threshold}" ]]; then
+  gate_args+=(--fail-daemon-rss-source-ratio "${daemon_rss_source_ratio_threshold}")
 fi
 
 cwd_args=()
