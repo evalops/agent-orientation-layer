@@ -19,7 +19,9 @@ else
   root="${user_home}/code"
 fi
 fallback_p95_ms="${ORIENT_WIDE_FALLBACK_P95_MS:-300}"
+fallback_p99_ms="${ORIENT_WIDE_FALLBACK_P99_MS:-${fallback_p95_ms}}"
 shard_p95_ms="${ORIENT_WIDE_SHARD_P95_MS:-300}"
+shard_p99_ms="${ORIENT_WIDE_SHARD_P99_MS:-${shard_p95_ms}}"
 family_limit="${ORIENT_WIDE_FAMILY_LIMIT:-1}"
 fallback="${ORIENT_WIDE_FALLBACK:-1}"
 shards="${ORIENT_WIDE_SHARDS:-1}"
@@ -53,7 +55,7 @@ for query in "${queries[@]}"; do
 done
 
 if [[ "${fallback}" == "1" ]]; then
-  echo "wide fallback gate: root=${root} p95<=${fallback_p95_ms}ms" >&2
+  echo "wide fallback gate: root=${root} p95<=${fallback_p95_ms}ms p99<=${fallback_p99_ms}ms" >&2
   target/release/orient bench-search \
     --repo "${root}" \
     --mode fallback \
@@ -61,6 +63,7 @@ if [[ "${fallback}" == "1" ]]; then
     --warmup "${ORIENT_WIDE_WARMUP:-1}" \
     --limit 10 \
     --fail-p95-ms "${fallback_p95_ms}" \
+    --fail-p99-ms "${fallback_p99_ms}" \
     "${query_args[@]}"
 else
   echo "skipping wide fallback gate; ORIENT_WIDE_FALLBACK=${fallback}" >&2
@@ -80,7 +83,7 @@ if [[ "${shards}" == "1" ]]; then
     "$(json_string "${output_dir}")"
   echo "wide shard status: output_dir=${output_dir}" >&2
   target/release/orient shard-status --index-dir "${output_dir}" --summary
-  echo "wide cached shard gate: output_dir=${output_dir} p95<=${shard_p95_ms}ms" >&2
+  echo "wide cached shard gate: output_dir=${output_dir} p95<=${shard_p95_ms}ms p99<=${shard_p99_ms}ms" >&2
   target/release/orient bench-shards \
     --index-dir "${output_dir}" \
     --cached \
@@ -88,5 +91,6 @@ if [[ "${shards}" == "1" ]]; then
     --warmup "${ORIENT_WIDE_SHARD_WARMUP:-1}" \
     --limit 10 \
     --fail-p95-ms "${shard_p95_ms}" \
+    --fail-p99-ms "${shard_p99_ms}" \
     "${query_args[@]}"
 fi

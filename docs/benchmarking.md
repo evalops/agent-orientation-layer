@@ -41,7 +41,11 @@ tools/ci/orient_agent_query_perf.sh | tee /tmp/orient-agent-bench.jsonl
 Use `ORIENT_AGENT_QUERY_FILE=/path/to/queries.txt` to replace the default query
 set. Blank lines and `#` comments are ignored. Use
 `ORIENT_AGENT_REBUILD_SHARDS=0` to reuse an existing shard directory, and set
-`ORIENT_AGENT_FALLBACK=0` when only cached shard latency matters.
+`ORIENT_AGENT_FALLBACK=0` when only cached shard latency matters. Set
+`ORIENT_AGENT_SHARDS=0` for a fast fallback-only run against a local workspace.
+`ORIENT_AGENT_FALLBACK_P95_MS`, `ORIENT_AGENT_FALLBACK_P99_MS`,
+`ORIENT_AGENT_SHARD_P95_MS`, and `ORIENT_AGENT_SHARD_P99_MS` turn this into a
+hard gate.
 
 Run the local shared-daemon benchmark with:
 
@@ -273,6 +277,11 @@ unscoped queries over very large multi-checkout workspaces are expected to expos
 routing and fanout limits; those numbers are planning inputs, not CI gates.
 For shard benchmarks, inspect each query's `shard_route` field. `selected_shards`
 near `total_shards` means the query is paying broad fanout cost before ranking.
+`tools/ci/orient_wide_perf.sh` is the compact workspace gate for the documented
+`/Documents/Projects` target. It gates fallback and cached-shard p95/p99 by
+default; tune those thresholds with `ORIENT_WIDE_FALLBACK_P95_MS`,
+`ORIENT_WIDE_FALLBACK_P99_MS`, `ORIENT_WIDE_SHARD_P95_MS`, and
+`ORIENT_WIDE_SHARD_P99_MS`.
 
 Current local baselines show the useful shape:
 
