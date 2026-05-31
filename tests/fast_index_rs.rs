@@ -4513,6 +4513,50 @@ fn indexed_search_filters_candidates_before_cap() {
 }
 
 #[test]
+fn indexed_symbol_filter_prunes_candidates_before_cap() {
+    let repo = tempfile::tempdir().unwrap();
+    for index in 0..1100 {
+        write(
+            &repo.path().join(format!("src/file_{index:04}.rs")),
+            "pub fn broad_match() { let _ = \"commonneedle runtime thing\"; }\n",
+        );
+    }
+    write(
+        &repo.path().join("src/zzzz_symbol_target.rs"),
+        "pub struct WebRuntimeThing;\npub fn broad_match() { let _ = \"commonneedle runtime thing\"; }\n",
+    );
+
+    let index = FastIndex::build(repo.path()).unwrap();
+    let results = index
+        .search_filtered(
+            "symbol:RuntimeThing commonneedle",
+            1,
+            &SearchFilters {
+                explain: true,
+                ..SearchFilters::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(result_paths(&results), vec!["src/zzzz_symbol_target.rs"]);
+    let plan = results[0].query_plan.as_ref().unwrap();
+    assert!(plan.candidate_count > plan.candidate_cap);
+    assert_eq!(plan.filtered_candidate_count, 1);
+    assert_eq!(plan.scored_candidate_count, 1);
+    assert!(!plan.candidate_cap_hit);
+    let symbol_filter = plan
+        .active_filters
+        .iter()
+        .find(|filter| filter.field == "symbol")
+        .unwrap();
+    assert_eq!(symbol_filter.candidate_matches, Some(1));
+    assert_eq!(
+        symbol_filter.candidate_rejections,
+        Some(plan.candidate_count - 1)
+    );
+}
+
+#[test]
 fn indexed_trigram_planner_unions_single_literal_and_substring_candidates() {
     let repo = tempfile::tempdir().unwrap();
     write(

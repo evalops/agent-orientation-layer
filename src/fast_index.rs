@@ -3359,6 +3359,7 @@ fn indexed_file_matches_filters_compiled(
         Some(&file.language),
         path_filters,
     ) && indexed_path_matches_symbol_kind_filters(file, filters)
+        && indexed_path_matches_symbol_filters(file, filters)
         && source_import_filters_match(&file.path, &file.content, filters)
         && source_excluded_content_filters_match(&file.content, filters)
 }
@@ -3425,6 +3426,21 @@ fn indexed_path_matches_symbol_filter(file: &IndexedPath, wanted: &str) -> bool 
     file.symbols
         .iter()
         .any(|symbol| symbol_filter_matches_name(&symbol.name, wanted))
+}
+
+fn indexed_path_matches_symbol_filters(file: &IndexedPath, filters: &SearchFilters) -> bool {
+    if filters.symbol.is_none() && filters.exclude_symbol.is_empty() {
+        return true;
+    }
+    if let Some(wanted) = &filters.symbol {
+        if !indexed_path_matches_symbol_filter(file, wanted) {
+            return false;
+        }
+    }
+    !filters
+        .exclude_symbol
+        .iter()
+        .any(|excluded| indexed_path_matches_symbol_filter(file, excluded))
 }
 
 fn indexed_path_matches_import_filter(file: &IndexedPath, wanted: &str) -> bool {
