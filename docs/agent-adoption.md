@@ -8,6 +8,27 @@ do not put machine-specific layouts or agent activity details into shared docs.
 For setup and shared-runtime operations, use [Shared Daemon](shared-daemon.md).
 For transport details and tool schemas, use [Agent Protocol](agent-protocol.md).
 
+## Bootstrap Commands
+
+Generate the shared-daemon setup commands for the repos agents are actively
+editing:
+
+```bash
+orient agent-bootstrap \
+  --repo /path/to/repo-a \
+  --repo /path/to/repo-b \
+  --output-dir /path/to/local/cache/orient-shards \
+  --clients 10
+```
+
+The shell output includes shard build, daemon start, status, instruction
+snippet, smoke search, and contention benchmark commands. Use
+`--format json` when an adapter wants the same commands as structured fields.
+Use `--discover-root` instead of repeated `--repo` when the active repos should
+be discovered from a workspace root, and pass `--warm-repo` for the checkouts
+that should be pinned hot when discovery covers more repos than the agents are
+currently using.
+
 ## Minimal Instructions
 
 Generate the live snippet with:

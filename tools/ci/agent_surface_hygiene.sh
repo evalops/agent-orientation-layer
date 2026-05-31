@@ -16,7 +16,17 @@ done
 
 "${orient_bin}" tool-manifest >"${scratch}/tool-manifest.json"
 "${orient_bin}" mcp-manifest >"${scratch}/mcp-manifest.json"
-outputs+=("${scratch}/tool-manifest.json" "${scratch}/mcp-manifest.json")
+"${orient_bin}" agent-bootstrap \
+  --repo /workspace/repo-a \
+  --repo /workspace/repo-b \
+  --output-dir /tmp/orient-shards \
+  --addr 127.0.0.1:8796 \
+  >"${scratch}/agent-bootstrap.sh"
+outputs+=(
+  "${scratch}/tool-manifest.json"
+  "${scratch}/mcp-manifest.json"
+  "${scratch}/agent-bootstrap.sh"
+)
 
 fixed_patterns=(
   'analytics'

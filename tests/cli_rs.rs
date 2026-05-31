@@ -631,6 +631,91 @@ fn cli_outputs_agent_instructions() {
 }
 
 #[test]
+fn cli_outputs_agent_bootstrap_commands() {
+    let mut shell = Command::cargo_bin("orient").unwrap();
+    shell
+        .args([
+            "agent-bootstrap",
+            "--repo",
+            "/work/repo-a",
+            "--repo",
+            "/work/repo-b",
+            "--output-dir",
+            "/tmp/orient-shards",
+            "--addr",
+            "127.0.0.1:9999",
+            "--profile",
+            "codex",
+            "--clients",
+            "10",
+            "--max-cached-indexes",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Orient local-agent bootstrap"))
+        .stdout(predicate::str::contains(
+            "orient ensure-shards --repo '/work/repo-a' --repo '/work/repo-b' --output-dir \"$ORIENT_SHARDS\"",
+        ))
+        .stdout(predicate::str::contains(
+            "orient serve-tcp --addr '127.0.0.1:9999' --index-dir '/tmp/orient-shards' --max-cached-indexes 2",
+        ))
+        .stdout(predicate::str::contains("--warm-repo '/work/repo-a'"))
+        .stdout(predicate::str::contains("--warm-query 'file:README.md'"))
+        .stdout(predicate::str::contains(
+            "orient agent-instructions --profile 'codex' --index-dir \"$ORIENT_SHARDS\" --addr '127.0.0.1:9999'",
+        ))
+        .stdout(predicate::str::contains(
+            "\"index_dir\":\"/tmp/orient-shards\"",
+        ))
+        .stdout(predicate::str::contains(
+            "orient bench-daemon-contend --addr '127.0.0.1:9999' --cwd '/work/repo-a' --cwd '/work/repo-b' --clients 10",
+        ));
+
+    let mut json = Command::cargo_bin("orient").unwrap();
+    let output = json
+        .args([
+            "agent-bootstrap",
+            "--format",
+            "json",
+            "--discover-root",
+            "/workspaces",
+            "--output-dir",
+            "/tmp/orient-shards",
+            "--socket",
+            "/tmp/orient.sock",
+            "--warm-repo",
+            "/workspaces/repo-a",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["env"]["ORIENT_SOCKET"],
+        serde_json::json!("/tmp/orient.sock")
+    );
+    assert!(
+        report["build_shards"]
+            .as_str()
+            .unwrap()
+            .contains("--discover-root '/workspaces'")
+    );
+    assert!(
+        report["serve_daemon"]
+            .as_str()
+            .unwrap()
+            .contains("serve-unix --socket '/tmp/orient.sock'")
+    );
+    assert!(
+        report["contention_benchmark"]
+            .as_str()
+            .unwrap()
+            .contains("--cwd '/workspaces/repo-a'")
+    );
+}
+
+#[test]
 fn cli_agent_guidance_accepts_socket_targets() {
     let mut guide = Command::cargo_bin("orient").unwrap();
     guide

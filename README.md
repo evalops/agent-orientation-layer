@@ -12,6 +12,14 @@ code-search artifacts only and has no telemetry.
 cargo install --git https://github.com/evalops/orient-search
 orient --version
 
+orient agent-bootstrap \
+  --repo /path/to/current/repo \
+  --output-dir /path/to/local/cache/orient-shards
+```
+
+Or run the shared daemon setup manually:
+
+```bash
 export ORIENT_WORKSPACES=/path/to/workspaces
 export ORIENT_SHARDS=/path/to/local/cache/orient-shards
 

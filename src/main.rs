@@ -1202,6 +1202,41 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = AgentProfileArg::Generic)]
         profile: AgentProfileArg,
     },
+    AgentBootstrap {
+        #[arg(long = "format", default_value = "sh", value_parser = ["sh", "json"])]
+        format: String,
+        #[arg(long = "repo")]
+        repos: Vec<PathBuf>,
+        #[arg(long = "discover-root")]
+        discover_roots: Vec<PathBuf>,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        max_depth: usize,
+        #[arg(long, default_value_t = 500)]
+        discover_limit: usize,
+        #[arg(long)]
+        family_limit: Option<usize>,
+        #[arg(long)]
+        nested_manifests: bool,
+        #[arg(long = "warm-repo")]
+        warm_repos: Vec<PathBuf>,
+        #[arg(long = "warm-query")]
+        warm_queries: Vec<String>,
+        #[arg(long)]
+        max_cached_indexes: Option<usize>,
+        #[arg(long, default_value_t = 10)]
+        clients: usize,
+        #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
+        socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "TCP daemon address; falls back to ORIENT_ADDR or 127.0.0.1:8796"
+        )]
+        addr: Option<String>,
+        #[arg(long, value_enum, default_value_t = AgentProfileArg::Generic)]
+        profile: AgentProfileArg,
+    },
     DaemonStatus {
         #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
         socket: Option<PathBuf>,
@@ -6387,6 +6422,45 @@ fn run() -> Result<()> {
                 )
             );
         }
+        Commands::AgentBootstrap {
+            format,
+            repos,
+            discover_roots,
+            output_dir,
+            max_depth,
+            discover_limit,
+            family_limit,
+            nested_manifests,
+            warm_repos,
+            warm_queries,
+            max_cached_indexes,
+            clients,
+            socket,
+            addr,
+            profile,
+        } => {
+            let target = resolve_daemon_target(socket, addr);
+            let report = agent_bootstrap(AgentBootstrapConfig {
+                repos,
+                discover_roots,
+                output_dir,
+                max_depth,
+                discover_limit,
+                family_limit: normalize_family_limit(family_limit),
+                nested_manifests,
+                warm_repos,
+                warm_queries,
+                max_cached_indexes,
+                clients,
+                target,
+                profile,
+            })?;
+            if format == "json" {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", agent_bootstrap_shell(&report));
+            }
+        }
         Commands::DaemonStatus {
             socket,
             addr,
@@ -7317,6 +7391,306 @@ fn print_doctor_report(report: &DoctorReport) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct AgentBootstrapConfig {
+    repos: Vec<PathBuf>,
+    discover_roots: Vec<PathBuf>,
+    output_dir: PathBuf,
+    max_depth: usize,
+    discover_limit: usize,
+    family_limit: Option<usize>,
+    nested_manifests: bool,
+    warm_repos: Vec<PathBuf>,
+    warm_queries: Vec<String>,
+    max_cached_indexes: Option<usize>,
+    clients: usize,
+    target: DaemonTarget,
+    profile: AgentProfileArg,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentBootstrapReport {
+    output_dir: PathBuf,
+    repos: Vec<PathBuf>,
+    discover_roots: Vec<PathBuf>,
+    warm_repos: Vec<PathBuf>,
+    warm_queries: Vec<String>,
+    env: BTreeMap<String, String>,
+    build_shards: String,
+    serve_daemon: String,
+    daemon_status: String,
+    agent_instructions: String,
+    smoke_search: String,
+    contention_benchmark: String,
+    notes: Vec<String>,
+}
+
+fn agent_bootstrap(config: AgentBootstrapConfig) -> Result<AgentBootstrapReport> {
+    if config.repos.is_empty() && config.discover_roots.is_empty() {
+        bail!("agent-bootstrap needs at least one --repo or --discover-root");
+    }
+    let warm_repos = if config.warm_repos.is_empty() {
+        config.repos.clone()
+    } else {
+        config.warm_repos.clone()
+    };
+    let warm_queries = if config.warm_queries.is_empty() {
+        vec![
+            "file:README.md".to_string(),
+            "kind:function handler".to_string(),
+            "path:src auth token".to_string(),
+        ]
+    } else {
+        config.warm_queries.clone()
+    };
+    let mut env_vars = BTreeMap::new();
+    env_vars.insert(
+        "ORIENT_SHARDS".to_string(),
+        config.output_dir.to_string_lossy().to_string(),
+    );
+    match &config.target {
+        DaemonTarget::Tcp(addr) => {
+            env_vars.insert("ORIENT_ADDR".to_string(), addr.clone());
+        }
+        #[cfg(unix)]
+        DaemonTarget::Unix(socket) => {
+            env_vars.insert(
+                "ORIENT_SOCKET".to_string(),
+                socket.to_string_lossy().to_string(),
+            );
+        }
+    }
+    let build_shards = agent_bootstrap_build_shards_command(&config);
+    let serve_daemon = agent_bootstrap_serve_command(
+        &config.target,
+        &config.output_dir,
+        &warm_repos,
+        &warm_queries,
+        config.max_cached_indexes,
+    );
+    let daemon_status = agent_bootstrap_status_command(&config.target);
+    let profile = config.profile.as_str();
+    let agent_instructions = agent_bootstrap_instructions_command(&config.target, profile);
+    let smoke_search = agent_bootstrap_smoke_search_command(&config.target, &config.output_dir);
+    let contention_benchmark = agent_bootstrap_contention_command(
+        &config.target,
+        &warm_repos,
+        config.clients.max(1),
+        &warm_queries,
+    );
+    let mut notes = vec![
+        "Run build_shards once or when repo membership changes.".to_string(),
+        "Run serve_daemon in a long-lived terminal before starting local agents.".to_string(),
+        "Give each agent the generated agent_instructions output and prefer search_auto before shell search.".to_string(),
+        "Use contention_benchmark to verify the shared daemon under local multi-agent load.".to_string(),
+    ];
+    if warm_repos.is_empty() {
+        notes.push(
+            "No warm repos were inferred; pass --warm-repo for active checkouts when using --discover-root only."
+                .to_string(),
+        );
+    }
+    Ok(AgentBootstrapReport {
+        output_dir: config.output_dir,
+        repos: config.repos,
+        discover_roots: config.discover_roots,
+        warm_repos,
+        warm_queries,
+        env: env_vars,
+        build_shards,
+        serve_daemon,
+        daemon_status,
+        agent_instructions,
+        smoke_search,
+        contention_benchmark,
+        notes,
+    })
+}
+
+fn agent_bootstrap_build_shards_command(config: &AgentBootstrapConfig) -> String {
+    let mut parts = vec!["orient".to_string(), "ensure-shards".to_string()];
+    for repo in &config.repos {
+        parts.push("--repo".to_string());
+        parts.push(shell_quote_path(repo));
+    }
+    for root in &config.discover_roots {
+        parts.push("--discover-root".to_string());
+        parts.push(shell_quote_path(root));
+    }
+    parts.push("--output-dir".to_string());
+    parts.push("\"$ORIENT_SHARDS\"".to_string());
+    parts.push("--max-depth".to_string());
+    parts.push(config.max_depth.to_string());
+    parts.push("--discover-limit".to_string());
+    parts.push(config.discover_limit.to_string());
+    if let Some(limit) = config.family_limit {
+        parts.push("--family-limit".to_string());
+        parts.push(limit.to_string());
+    }
+    if config.nested_manifests {
+        parts.push("--nested-manifests".to_string());
+    }
+    parts.join(" ")
+}
+
+fn agent_bootstrap_serve_command(
+    target: &DaemonTarget,
+    output_dir: &Path,
+    warm_repos: &[PathBuf],
+    warm_queries: &[String],
+    max_cached_indexes: Option<usize>,
+) -> String {
+    let mut parts = match target {
+        DaemonTarget::Tcp(addr) => vec![
+            "orient".to_string(),
+            "serve-tcp".to_string(),
+            "--addr".to_string(),
+            shell_quote(addr),
+        ],
+        #[cfg(unix)]
+        DaemonTarget::Unix(socket) => vec![
+            "orient".to_string(),
+            "serve-unix".to_string(),
+            "--socket".to_string(),
+            shell_quote_path(socket),
+        ],
+    };
+    parts.push("--index-dir".to_string());
+    parts.push(shell_quote_path(output_dir));
+    if let Some(max_cached_indexes) = max_cached_indexes {
+        parts.push("--max-cached-indexes".to_string());
+        parts.push(max_cached_indexes.to_string());
+    }
+    for repo in warm_repos {
+        parts.push("--warm-repo".to_string());
+        parts.push(shell_quote_path(repo));
+    }
+    for query in warm_queries {
+        parts.push("--warm-query".to_string());
+        parts.push(shell_quote(query));
+    }
+    parts.join(" ")
+}
+
+fn agent_bootstrap_status_command(target: &DaemonTarget) -> String {
+    match target {
+        DaemonTarget::Tcp(addr) if addr == DEFAULT_DAEMON_ADDR => {
+            "orient daemon-status --format json".to_string()
+        }
+        DaemonTarget::Tcp(addr) => {
+            format!(
+                "orient daemon-status --addr {} --format json",
+                shell_quote(addr)
+            )
+        }
+        #[cfg(unix)]
+        DaemonTarget::Unix(socket) => format!(
+            "orient daemon-status --socket {} --format json",
+            shell_quote_path(socket)
+        ),
+    }
+}
+
+fn agent_bootstrap_instructions_command(target: &DaemonTarget, profile: &str) -> String {
+    let mut command = format!(
+        "orient agent-instructions --profile {} --index-dir \"$ORIENT_SHARDS\"",
+        shell_quote(profile),
+    );
+    match target {
+        DaemonTarget::Tcp(addr) if addr != DEFAULT_DAEMON_ADDR => {
+            command.push_str(&format!(" --addr {}", shell_quote(addr)));
+        }
+        DaemonTarget::Tcp(_) => {}
+        #[cfg(unix)]
+        DaemonTarget::Unix(socket) => {
+            command.push_str(&format!(" --socket {}", shell_quote_path(socket)));
+        }
+    }
+    command
+}
+
+fn agent_bootstrap_smoke_search_command(target: &DaemonTarget, output_dir: &Path) -> String {
+    let jsonl = serde_json::json!({
+        "id": "search",
+        "tool": "search_auto",
+        "arguments": {
+            "index_dir": output_dir,
+            "query": "file:README.md",
+            "limit": 5,
+            "summary": true,
+            "retry_if_empty": true
+        }
+    })
+    .to_string();
+    format!(
+        "printf '%s\\n' {} | {}",
+        shell_quote(&jsonl),
+        target.client_command()
+    )
+}
+
+fn agent_bootstrap_contention_command(
+    target: &DaemonTarget,
+    warm_repos: &[PathBuf],
+    clients: usize,
+    warm_queries: &[String],
+) -> String {
+    let mut parts = vec!["orient".to_string(), "bench-daemon-contend".to_string()];
+    match target {
+        DaemonTarget::Tcp(addr) if addr != DEFAULT_DAEMON_ADDR => {
+            parts.push("--addr".to_string());
+            parts.push(shell_quote(addr));
+        }
+        DaemonTarget::Tcp(_) => {}
+        #[cfg(unix)]
+        DaemonTarget::Unix(socket) => {
+            parts.push("--socket".to_string());
+            parts.push(shell_quote_path(socket));
+        }
+    }
+    for repo in warm_repos {
+        parts.push("--cwd".to_string());
+        parts.push(shell_quote_path(repo));
+    }
+    parts.push("--clients".to_string());
+    parts.push(clients.to_string());
+    parts.push("--runs".to_string());
+    parts.push("20".to_string());
+    parts.push("--warmup".to_string());
+    parts.push("5".to_string());
+    parts.push("--fail-fallback-rate".to_string());
+    parts.push("0".to_string());
+    for query in warm_queries {
+        parts.push("--query".to_string());
+        parts.push(shell_quote(query));
+    }
+    parts.push("--range".to_string());
+    parts.push("README.md:1:40".to_string());
+    parts.join(" ")
+}
+
+fn agent_bootstrap_shell(report: &AgentBootstrapReport) -> String {
+    let mut lines = vec![
+        "# Orient local-agent bootstrap".to_string(),
+        "# 1. Build or refresh local shards.".to_string(),
+    ];
+    for (name, value) in &report.env {
+        lines.push(format!("export {name}={}", shell_quote(value)));
+    }
+    lines.push(report.build_shards.clone());
+    lines.push(String::new());
+    lines.push("# 2. Start the shared daemon in a long-lived terminal.".to_string());
+    lines.push(report.serve_daemon.clone());
+    lines.push(String::new());
+    lines.push("# 3. From agent terminals, verify status and generate instructions.".to_string());
+    lines.push(report.daemon_status.clone());
+    lines.push(report.agent_instructions.clone());
+    lines.push(String::new());
+    lines.push("# 4. Smoke search and benchmark the shared daemon.".to_string());
+    lines.push(report.smoke_search.clone());
+    lines.push(report.contention_benchmark.clone());
+    lines.join("\n")
 }
 
 fn repo_has_git_metadata(path: &Path) -> bool {
