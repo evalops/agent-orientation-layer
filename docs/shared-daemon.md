@@ -34,10 +34,12 @@ lazily when a search, read, map, or symbol request touches them. The daemon
 keeps at most 64 lazy indexes and uses at most 8 shard workers per query by
 default. When started with `--warm-index-dir`, the default cache grows to the
 warmed shard count so startup warming does not immediately evict shards. Pass
-`--max-cached-indexes N` and set `ORIENT_MAX_SHARD_WORKERS=N` when a shared
-daemon should stay tighter, keep more hot repos resident, or avoid CPU
-oversubscription during many-agent runs. Use `--warm-index-dir "$ORIENT_SHARDS"`
-only when you explicitly want shard indexes loaded at startup.
+`--max-cached-indexes N`, set `ORIENT_MAX_SHARD_WORKERS=N` for per-query fanout,
+and set `ORIENT_MAX_DAEMON_SHARD_WORKERS=N` for aggregate daemon fanout. The
+daemon-wide fanout cap defaults to the per-query cap so many-agent runs do not
+multiply broad shard searches into CPU oversubscription. Use
+`--warm-index-dir "$ORIENT_SHARDS"` only when you explicitly want shard indexes
+loaded at startup.
 
 For one repo, use a single persisted index:
 

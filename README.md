@@ -30,9 +30,10 @@ orient serve-tcp \
 `--index-dir` registers the shard manifest and lazily loads individual repo
 indexes on first use. The daemon keeps at most 64 lazy indexes by default; when
 using `--warm-index-dir`, it sizes the default cache to the warmed shard count.
-Set `--max-cached-indexes N` and `ORIENT_MAX_SHARD_WORKERS=N` to tune shared
-multi-agent runs. Use `--warm-index-dir "$ORIENT_SHARDS"` only when you
-intentionally want to load shard indexes at startup.
+Set `--max-cached-indexes N`, `ORIENT_MAX_SHARD_WORKERS=N`, and
+`ORIENT_MAX_DAEMON_SHARD_WORKERS=N` to tune shared multi-agent runs. Use
+`--warm-index-dir "$ORIENT_SHARDS"` only when you intentionally want to load
+shard indexes at startup.
 
 Then verify the daemon and generate the short instruction snippet:
 

@@ -11701,6 +11701,14 @@ fn tcp_daemon_status_cli_reports_runtime_cache() {
         status["max_shard_workers"],
         serde_json::json!(DEFAULT_MAX_SHARD_WORKERS)
     );
+    assert_eq!(
+        status["max_concurrent_shard_workers"],
+        serde_json::json!(DEFAULT_MAX_SHARD_WORKERS)
+    );
+    assert_eq!(
+        status["available_concurrent_shard_workers"],
+        status["max_concurrent_shard_workers"]
+    );
     assert_eq!(status["cached_indexes"], serde_json::json!(0));
     assert_eq!(status["cached_shard_manifests"], serde_json::json!(0));
     assert_eq!(
@@ -11735,6 +11743,14 @@ fn tcp_daemon_status_cli_reports_runtime_cache() {
     assert_eq!(
         status["max_shard_workers"],
         serde_json::json!(DEFAULT_MAX_SHARD_WORKERS)
+    );
+    assert_eq!(
+        status["max_concurrent_shard_workers"],
+        serde_json::json!(DEFAULT_MAX_SHARD_WORKERS)
+    );
+    assert_eq!(
+        status["available_concurrent_shard_workers"],
+        status["max_concurrent_shard_workers"]
     );
     assert!(status["search_auto_default"]["target"].as_str().is_some());
     let default_target = status["search_auto_default"]["target"].clone();

@@ -36,6 +36,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -52,6 +53,7 @@ pub const MAX_BATCH_QUERIES: usize = 32;
 pub const MAX_BATCH_RANGES: usize = 64;
 pub const DEFAULT_MAX_CACHED_INDEXES: usize = 64;
 const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8796";
+const MAX_DAEMON_SHARD_WORKERS_ENV: &str = "ORIENT_MAX_DAEMON_SHARD_WORKERS";
 
 #[derive(Debug, Deserialize)]
 pub struct ToolRequest {
@@ -1017,6 +1019,7 @@ pub struct ToolRuntime {
     shard_manifests: Mutex<HashMap<PathBuf, CachedShardManifest>>,
     next_index_access: AtomicU64,
     cache_policy: IndexCachePolicy,
+    shard_worker_pool: ShardWorkerPool,
     started_at: SystemTime,
 }
 
@@ -1032,7 +1035,73 @@ impl Default for ToolRuntime {
             shard_manifests: Mutex::new(HashMap::new()),
             next_index_access: AtomicU64::new(1),
             cache_policy: IndexCachePolicy::default(),
+            shard_worker_pool: ShardWorkerPool::new(configured_max_daemon_shard_workers()),
             started_at: SystemTime::now(),
+        }
+    }
+}
+
+struct ShardWorkerPool {
+    limit: usize,
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+struct ShardWorkerPermit<'a> {
+    pool: &'a ShardWorkerPool,
+    count: usize,
+}
+
+impl ShardWorkerPool {
+    fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
+        Self {
+            limit,
+            available: Mutex::new(limit),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn available(&self) -> usize {
+        self.available
+            .lock()
+            .map(|available| *available)
+            .unwrap_or(0)
+    }
+
+    fn acquire(&self, requested: usize) -> Result<ShardWorkerPermit<'_>> {
+        let requested = requested.max(1).min(self.limit);
+        let mut available = self
+            .available
+            .lock()
+            .map_err(|_| anyhow!("shard worker pool lock poisoned"))?;
+        while *available == 0 {
+            available = self
+                .ready
+                .wait(available)
+                .map_err(|_| anyhow!("shard worker pool lock poisoned"))?;
+        }
+        let count = requested.min(*available);
+        *available -= count;
+        Ok(ShardWorkerPermit { pool: self, count })
+    }
+}
+
+impl ShardWorkerPermit<'_> {
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl Drop for ShardWorkerPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut available) = self.pool.available.lock() {
+            *available = (*available + self.count).min(self.pool.limit);
+            self.pool.ready.notify_all();
         }
     }
 }
@@ -1282,6 +1351,8 @@ impl ToolRuntime {
             "started_at_unix_secs": system_time_unix_secs(self.started_at),
             "uptime_secs": daemon_uptime_secs(self.started_at),
             "max_shard_workers": configured_max_shard_workers(),
+            "max_concurrent_shard_workers": self.shard_worker_pool.limit(),
+            "available_concurrent_shard_workers": self.shard_worker_pool.available(),
             "search_auto_default": search_auto_default.clone(),
             "default_requests": default_requests,
             "max_cached_indexes": self.max_cached_indexes(),
@@ -1351,6 +1422,14 @@ fn system_time_unix_secs(value: SystemTime) -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn configured_max_daemon_shard_workers() -> usize {
+    env::var(MAX_DAEMON_SHARD_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| configured_max_shard_workers().max(1))
 }
 
 pub fn tool_manifest() -> Value {
@@ -7634,7 +7713,10 @@ impl ToolRuntime {
             return Ok(Vec::new());
         }
 
-        let workers = bounded_shard_worker_count(jobs.len());
+        let permit = self
+            .shard_worker_pool
+            .acquire(bounded_shard_worker_count(jobs.len()))?;
+        let workers = permit.count();
         if workers <= 1 {
             return self.search_shard_job_batch_cached(index_dir, query, limit, filters, &jobs);
         }
@@ -7772,7 +7854,10 @@ impl ToolRuntime {
             return Ok(Vec::new());
         }
 
-        let workers = bounded_shard_worker_count(jobs.len());
+        let permit = self
+            .shard_worker_pool
+            .acquire(bounded_shard_worker_count(jobs.len()))?;
+        let workers = permit.count();
         if workers <= 1 {
             return self.shard_query_plan_job_batch_cached(index_dir, query, filters, &jobs);
         }

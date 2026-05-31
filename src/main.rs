@@ -6239,6 +6239,14 @@ fn daemon_status_summary(status: &Value) -> Value {
             .get("max_shard_workers")
             .cloned()
             .unwrap_or(Value::Null),
+        "max_concurrent_shard_workers": status
+            .get("max_concurrent_shard_workers")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "available_concurrent_shard_workers": status
+            .get("available_concurrent_shard_workers")
+            .cloned()
+            .unwrap_or(Value::Null),
         "search_auto_default": {
             "surface": search_default.get("surface").cloned().unwrap_or(Value::Null),
             "source": search_default.get("source").cloned().unwrap_or(Value::Null),

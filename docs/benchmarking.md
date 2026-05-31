@@ -46,7 +46,9 @@ scope shared shard daemons to the current checkout. The request timeout bounds
 each daemon round trip so a stalled daemon fails the benchmark instead of
 hanging the caller. For warmed multi-shard daemons, compare the startup
 `cached_indexes` and `max_cached_indexes` fields; a cache smaller than the shard
-count can turn broad fanout queries into cache churn.
+count can turn broad fanout queries into cache churn. Also check
+`max_concurrent_shard_workers`; this is the daemon-wide fanout budget shared by
+concurrent requests and defaults to `max_shard_workers`, the per-query cap.
 
 The default query set intentionally mixes:
 
