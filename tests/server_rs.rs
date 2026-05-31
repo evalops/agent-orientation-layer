@@ -10328,6 +10328,68 @@ fn runtime_caches_repeated_warm_shard_searches() {
 }
 
 #[test]
+fn runtime_reuses_higher_limit_shard_search_cache_for_lower_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for index in 0..4 {
+        let repo = root.path().join(format!("service_{index}"));
+        write(
+            &repo.join("src/lib.rs"),
+            &format!("pub fn shared_search_token_{index}() -> usize {{ {index} }}\n"),
+        );
+        write(
+            &repo.join("Cargo.toml"),
+            &format!("[package]\nname='service-{index}'\nversion='0.1.0'\nedition='2024'\n"),
+        );
+        repos.push(repo);
+    }
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+
+    let runtime = ToolRuntime::default();
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+    runtime
+        .warm_shard_queries(
+            shard_dir.path().to_path_buf(),
+            &["shared search token".to_string()],
+            5,
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 1);
+
+    let hits_before = runtime.completed_shard_search_cache_hit_count();
+    let lower_limit = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("lower-limit"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "shared search token",
+            "limit": 2,
+            "require_all": true
+        }),
+    });
+    assert!(lower_limit.error.is_none(), "{:?}", lower_limit.error);
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 1);
+    assert!(
+        runtime.completed_shard_search_cache_hit_count() > hits_before,
+        "lower-limit shard searches should reuse a higher-limit completed cache entry"
+    );
+    assert_eq!(
+        lower_limit
+            .result
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn runtime_caches_repeated_empty_shard_query_plans() {
     let root = tempfile::tempdir().unwrap();
     let mut repos = Vec::new();

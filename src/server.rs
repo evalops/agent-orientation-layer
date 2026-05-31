@@ -7641,6 +7641,19 @@ impl ToolRuntime {
                 .fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(Some(entry.value.clone()));
         }
+        let superset_key = searches
+            .iter()
+            .filter(|(candidate, _)| shard_search_key_can_serve_limit(candidate, key))
+            .min_by_key(|(candidate, _)| candidate.limit)
+            .map(|(candidate, _)| candidate.clone());
+        if let Some(superset_key) = superset_key {
+            if let Some(entry) = searches.get_mut(&superset_key) {
+                entry.last_access = access;
+                self.completed_shard_search_hits
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(Some(entry.value.clone()));
+            }
+        }
         Ok(None)
     }
 
@@ -9108,6 +9121,17 @@ fn shard_filter_may_touch_affected_shard(
     affected: &AffectedShardIndex,
 ) -> bool {
     !shard_search_scopes(&affected.shard, filters).is_empty()
+}
+
+fn shard_search_key_can_serve_limit(
+    candidate: &ShardSearchKey,
+    requested: &ShardSearchKey,
+) -> bool {
+    candidate.index_dir == requested.index_dir
+        && candidate.query == requested.query
+        && candidate.limit >= requested.limit
+        && candidate.filters == requested.filters
+        && candidate.epoch == requested.epoch
 }
 
 fn evict_oldest_completed_work<K: Clone + Eq + Hash, T>(
