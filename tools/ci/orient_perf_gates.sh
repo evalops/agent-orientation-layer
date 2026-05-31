@@ -31,6 +31,7 @@ route_shard_dir="${tmpdir}/route-shards"
 churn_repo="${tmpdir}/churn-repo"
 churn_shard_dir="${tmpdir}/churn-shards"
 cold_daemon_addr="${ORIENT_PERF_GATES_COLD_DAEMON_ADDR:-127.0.0.1:8794}"
+mixed_daemon_addr="${ORIENT_PERF_GATES_MIXED_DAEMON_ADDR:-127.0.0.1:8798}"
 
 target/release/orient bench-search \
   --repo . \
@@ -202,9 +203,70 @@ target/release/orient bench-daemon-contend \
   --limit 10 \
   --request-timeout-ms 30000 \
   --fail-p95-ms 250 \
+  --fail-p99-ms 300 \
   --fail-first-wave-p95-ms 250 \
   --fail-fallback-rate 0 \
   --query "commonroutegate"
+
+kill "${daemon_pid}" 2>/dev/null || true
+wait "${daemon_pid}" 2>/dev/null || true
+daemon_pid=""
+
+mixed_daemon_log="${tmpdir}/orient-daemon-mixed.log"
+target/release/orient serve-tcp \
+  --addr "${mixed_daemon_addr}" \
+  --index-dir "${route_shard_dir}" \
+  --warm-repo "${route_workspace}/route-repo-0" \
+  --warm-repo "${route_workspace}/route-repo-42" \
+  --warm-query "commonroutegate" \
+  --max-cached-indexes 2 \
+  >"${mixed_daemon_log}" 2>&1 &
+daemon_pid="$!"
+
+mixed_ready=0
+for _ in $(seq 1 60); do
+  if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+    | target/release/orient client-jsonl --addr "${mixed_daemon_addr}" --require-version >/dev/null 2>&1; then
+    mixed_ready=1
+    break
+  fi
+  if ! kill -0 "${daemon_pid}" 2>/dev/null; then
+    echo "daemon exited before mixed contention gate readiness" >&2
+    cat "${mixed_daemon_log}" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+if [[ "${mixed_ready}" != "1" ]]; then
+  echo "daemon did not become ready for mixed contention gate at ${mixed_daemon_addr}" >&2
+  cat "${mixed_daemon_log}" >&2 || true
+  exit 1
+fi
+
+mixed_cwds=()
+for _ in $(seq 1 5); do
+  mixed_cwds+=(--cwd "${route_workspace}/route-repo-0")
+  mixed_cwds+=(--cwd "${route_workspace}/route-repo-42")
+done
+mixed_ranges=()
+for _ in $(seq 1 8); do
+  mixed_ranges+=(--range "src/lib.rs:1:4")
+done
+target/release/orient bench-daemon-contend \
+  --addr "${mixed_daemon_addr}" \
+  "${mixed_cwds[@]}" \
+  --clients 10 \
+  --runs 8 \
+  --warmup 3 \
+  --jitter-ms 10 \
+  --limit 10 \
+  --request-timeout-ms 30000 \
+  --fail-p95-ms 150 \
+  --fail-p99-ms 300 \
+  --fail-fallback-rate 0 \
+  --query "commonroutegate" \
+  --query "commonroutegate" \
+  "${mixed_ranges[@]}"
 
 kill "${daemon_pid}" 2>/dev/null || true
 wait "${daemon_pid}" 2>/dev/null || true
@@ -266,6 +328,7 @@ target/release/orient bench-daemon-churn \
   --limit 10 \
   --request-timeout-ms 30000 \
   --fail-p95-ms 1000 \
+  --fail-p99-ms 1000 \
   --fail-fallback-rate 0 \
   --fail-refresh-overhead-ms 250 \
   --query "orient_churn_token"

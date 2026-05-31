@@ -26,6 +26,9 @@ max_cached_indexes="${ORIENT_DAEMON_CONTEND_MAX_CACHED_INDEXES:-2}"
 max_depth="${ORIENT_DAEMON_CONTEND_MAX_DEPTH:-4}"
 discover_limit="${ORIENT_DAEMON_CONTEND_DISCOVER_LIMIT:-500}"
 mode="${ORIENT_DAEMON_CONTEND_MODE:-warm}"
+p95_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P95_MS:-}"
+p99_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P99_MS:-}"
+fallback_rate_threshold="${ORIENT_DAEMON_CONTEND_FAIL_FALLBACK_RATE:-}"
 
 if [[ ! -d "${root}" ]]; then
   if [[ "${ORIENT_DAEMON_CONTEND_REQUIRE_ROOT:-0}" == "1" ]]; then
@@ -108,6 +111,17 @@ for range in "${ranges[@]}"; do
   range_args+=(--range "${range}")
 done
 
+gate_args=()
+if [[ -n "${p95_threshold_ms}" ]]; then
+  gate_args+=(--fail-p95-ms "${p95_threshold_ms}")
+fi
+if [[ -n "${p99_threshold_ms}" ]]; then
+  gate_args+=(--fail-p99-ms "${p99_threshold_ms}")
+fi
+if [[ -n "${fallback_rate_threshold}" ]]; then
+  gate_args+=(--fail-fallback-rate "${fallback_rate_threshold}")
+fi
+
 cwd_args=()
 warm_repo_args=()
 for cwd in "${cwds[@]}"; do
@@ -184,6 +198,7 @@ run_case() {
     --jitter-ms "${jitter_ms}" \
     --limit "${limit}" \
     --request-timeout-ms "${request_timeout_ms}" \
+    "${gate_args[@]}" \
     "${query_args[@]}" \
     "${range_args[@]}"
 }

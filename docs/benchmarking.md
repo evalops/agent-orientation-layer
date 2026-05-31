@@ -224,6 +224,9 @@ orient bench-daemon-contend \
   --warmup 5 \
   --jitter-ms 50 \
   --request-timeout-ms 30000 \
+  --fail-p95-ms 300 \
+  --fail-p99-ms 500 \
+  --fail-fallback-rate 0 \
   --query "symbol:SessionManager token" \
   --query "file:Cargo.toml" \
   --range src/main.rs:1:40
@@ -235,12 +238,26 @@ deterministic jitter between operations. It reports `sample_count` as
 `clients * runs`, keeps per-operation p50/p95/p99/max samples, and adds
 `wall_ms`, `ops_per_sec`, `first_wave_p95_ms`, and `first_wave_max_ms` to the
 summary. Use it when several local agent processes share one daemon and you care
-about contention rather than a single synchronized wave.
+about contention rather than a single synchronized wave. `--fail-p95-ms`,
+`--fail-p99-ms`, and `--fail-fallback-rate` make the report usable as a local or
+CI gate.
 
 For cold-start behavior, start a fresh daemon and run the same command with
 `--warmup 0`. The first-wave fields then show the initial concurrent touch cost.
 Run it again with the normal warmup value to compare cold first touch against
 steady shared-daemon behavior.
+
+The CI perf gate includes a warm mixed-contention case for the practical local
+agent shape: 10 clients sharing one daemon over two warmed repos, with an
+operation mix weighted toward `read_range` and a smaller number of searches.
+That gate is intentionally about tail latency and fallback avoidance, not task
+success scoring.
+
+`tools/ci/orient_daemon_contention_perf.sh` can run the same shared-daemon shape
+against a local workspace. Set `ORIENT_DAEMON_CONTEND_FAIL_P95_MS`,
+`ORIENT_DAEMON_CONTEND_FAIL_P99_MS`, and
+`ORIENT_DAEMON_CONTEND_FAIL_FALLBACK_RATE` when you want it to behave as a hard
+gate instead of a measurement run.
 
 The default query set intentionally mixes:
 

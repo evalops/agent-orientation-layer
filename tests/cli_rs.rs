@@ -6434,6 +6434,25 @@ fn cli_benchmark_can_fail_on_p95_threshold() {
     .failure()
     .stderr(predicate::str::contains("exceeded threshold"));
 
+    let mut p99_cmd = Command::cargo_bin("orient").unwrap();
+    p99_cmd
+        .args([
+            "bench-search",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--fail-p99-ms",
+            "0",
+            "issue token",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("p99"))
+        .stderr(predicate::str::contains("exceeded threshold"));
+
     let shard_dir = tempfile::tempdir().unwrap();
     let mut build_shards = Command::cargo_bin("orient").unwrap();
     build_shards

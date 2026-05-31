@@ -886,6 +886,8 @@ enum Commands {
         #[arg(long)]
         fail_p95_ms: Option<f64>,
         #[arg(long)]
+        fail_p99_ms: Option<f64>,
+        #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
         allow_baseline_mode_mismatch: bool,
@@ -919,6 +921,8 @@ enum Commands {
         filters: CommonSearchArgs,
         #[arg(long)]
         fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_ms: Option<f64>,
         #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
@@ -956,6 +960,8 @@ enum Commands {
         filters: CommonSearchArgs,
         #[arg(long)]
         fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_ms: Option<f64>,
         #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
@@ -995,6 +1001,8 @@ enum Commands {
         #[arg(long)]
         fail_p95_ms: Option<f64>,
         #[arg(long)]
+        fail_p99_ms: Option<f64>,
+        #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
         write_baseline: Option<PathBuf>,
@@ -1031,6 +1039,8 @@ enum Commands {
         range_args: Vec<CliRangeSpec>,
         #[arg(long)]
         fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_ms: Option<f64>,
         #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
@@ -1077,6 +1087,8 @@ enum Commands {
         #[arg(long)]
         fail_p95_ms: Option<f64>,
         #[arg(long)]
+        fail_p99_ms: Option<f64>,
+        #[arg(long)]
         fail_fallback_rate: Option<f64>,
         #[arg(long)]
         fail_refresh_overhead_ms: Option<f64>,
@@ -1113,6 +1125,8 @@ enum Commands {
         range_args: Vec<CliRangeSpec>,
         #[arg(long)]
         fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_ms: Option<f64>,
         #[arg(long)]
         fail_fallback_rate: Option<f64>,
         #[arg(long)]
@@ -5887,6 +5901,7 @@ fn run() -> Result<()> {
             repo_filter,
             filters,
             fail_p95_ms,
+            fail_p99_ms,
             baseline,
             allow_baseline_mode_mismatch,
             require_faster_than_baseline,
@@ -5923,6 +5938,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
+            }
         }
         Commands::BenchShards {
             index_dir,
@@ -5934,6 +5952,7 @@ fn run() -> Result<()> {
             repo,
             filters,
             fail_p95_ms,
+            fail_p99_ms,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -5961,6 +5980,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
+            }
         }
         Commands::BenchDaemon {
             socket,
@@ -5974,6 +5996,7 @@ fn run() -> Result<()> {
             repo_filter,
             filters,
             fail_p95_ms,
+            fail_p99_ms,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6003,6 +6026,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonRead {
             socket,
@@ -6015,6 +6041,7 @@ fn run() -> Result<()> {
             range_args,
             ranges,
             fail_p95_ms,
+            fail_p99_ms,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6039,6 +6066,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonMix {
             socket,
@@ -6054,6 +6084,7 @@ fn run() -> Result<()> {
             query_args,
             range_args,
             fail_p95_ms,
+            fail_p99_ms,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6081,6 +6112,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonChurn {
             socket,
@@ -6100,6 +6134,7 @@ fn run() -> Result<()> {
             baseline_runs,
             keep_churn_files,
             fail_p95_ms,
+            fail_p99_ms,
             fail_fallback_rate,
             fail_refresh_overhead_ms,
         } => {
@@ -6124,6 +6159,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
+            }
             if let Some(threshold) = fail_fallback_rate {
                 fail_bench_fallback_rate(&report, threshold)?;
             }
@@ -6146,6 +6184,7 @@ fn run() -> Result<()> {
             query_args,
             range_args,
             fail_p95_ms,
+            fail_p99_ms,
             fail_fallback_rate,
             fail_first_wave_p95_ms,
         } => {
@@ -6166,6 +6205,9 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&report)?);
             if let Some(threshold) = fail_p95_ms {
                 fail_slow_bench_queries(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_p99_ms {
+                fail_bench_p99_queries(&report, threshold)?;
             }
             if let Some(threshold) = fail_fallback_rate {
                 fail_bench_fallback_rate(&report, threshold)?;
@@ -9408,6 +9450,23 @@ fn fail_slow_bench_queries(report: &BenchReport, threshold: f64) -> Result<()> {
         bail!(
             "p95 {:.3}ms for query {:?} exceeded threshold {:.3}ms",
             slowest.p95_ms,
+            slowest.query,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_bench_p99_queries(report: &BenchReport, threshold: f64) -> Result<()> {
+    if let Some(slowest) = report
+        .queries
+        .iter()
+        .filter(|query| query.p99_ms > threshold)
+        .max_by(|left, right| left.p99_ms.total_cmp(&right.p99_ms))
+    {
+        bail!(
+            "p99 {:.3}ms for query {:?} exceeded threshold {:.3}ms",
+            slowest.p99_ms,
             slowest.query,
             threshold
         );
