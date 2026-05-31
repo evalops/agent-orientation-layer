@@ -1,6 +1,6 @@
 # Benchmarking
 
-Orient has four benchmark layers:
+Orient has these benchmark surfaces:
 
 - `tools/ci/orient_perf_gates.sh` is the small CI gate. It keeps release builds,
   unit-level search behavior, JSON-lines smoke coverage, and latency regressions
@@ -8,9 +8,9 @@ Orient has four benchmark layers:
 - `tools/ci/orient_agent_query_perf.sh` is the local agent-workload benchmark.
   It discovers a local workspace, builds shards with worktree-family limiting,
   and runs a mixed query set that looks like what coding agents ask for.
-- `orient bench-index` measures persisted index build or refresh latency plus
-  footprint and reuse stats, so large-repo indexing cost is visible separately
-  from query latency.
+- `orient bench-index` measures persisted index build, no-op refresh, or dirty
+  refresh latency plus footprint and reuse stats, so large-repo indexing cost is
+  visible separately from query latency.
 - `orient bench-daemon` is the shared-daemon concurrency benchmark. It sends
   simultaneous JSON-lines `search_auto` requests to one daemon so a local
   multi-agent setup can check queueing and tail latency.
@@ -76,8 +76,11 @@ orient bench-index \
 ```
 
 Use `--mode build` to delete and rebuild the index for each measured sample.
-The report includes elapsed samples, index bytes, source bytes,
-`index_to_source_ratio`, and the latest refresh reuse counts.
+Use `--mode churn` to write small marker files under `.orient-index-bench`
+before each warmup and measured refresh. Churn files are removed after the run
+unless `--keep-churn-files` is set. The report includes elapsed samples, index
+bytes, source bytes, `index_to_source_ratio`, churn writes, and the latest
+refresh reuse counts.
 
 Run the multi-agent contention benchmark with:
 

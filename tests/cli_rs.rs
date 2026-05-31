@@ -6348,6 +6348,43 @@ fn cli_reports_index_build_and_refresh_benchmarks() {
         .stdout(predicate::str::contains("\"mode\":\"refresh\""))
         .stdout(predicate::str::contains("\"reused_files\""))
         .stdout(predicate::str::contains("\"refreshed_files\""));
+
+    let mut churn = Command::cargo_bin("orient").unwrap();
+    let churn_output = churn
+        .args([
+            "bench-index",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index",
+            index_path.to_str().unwrap(),
+            "--mode",
+            "churn",
+            "--runs",
+            "2",
+            "--warmup",
+            "1",
+            "--churn-files",
+            "1",
+            "--fail-p99-ms",
+            "1000",
+        ])
+        .output()
+        .unwrap();
+    assert!(churn_output.status.success());
+    let churn_report: serde_json::Value = serde_json::from_slice(&churn_output.stdout).unwrap();
+    assert_eq!(churn_report["mode"], serde_json::json!("churn"));
+    assert_eq!(
+        churn_report["summary"]["churn_writes"],
+        serde_json::json!(3)
+    );
+    assert!(churn_report["summary"]["refreshed_files"].as_u64().unwrap() >= 1);
+    assert!(
+        !repo
+            .path()
+            .join(".orient-index-bench")
+            .join("orient_churn_0.rs")
+            .exists()
+    );
 }
 
 #[test]

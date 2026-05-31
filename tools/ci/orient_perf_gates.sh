@@ -52,6 +52,15 @@ target/release/orient bench-index \
   --warmup 1 \
   --fail-p95-ms 10000 \
   --fail-p99-ms 10000
+target/release/orient bench-index \
+  --repo . \
+  --index "${index_path}" \
+  --mode churn \
+  --runs 2 \
+  --warmup 1 \
+  --churn-files 1 \
+  --fail-p95-ms 10000 \
+  --fail-p99-ms 10000
 target/release/orient bench-search \
   --repo . \
   --index "${index_path}" \

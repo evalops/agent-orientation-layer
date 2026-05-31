@@ -151,6 +151,12 @@ enum Commands {
         runs: usize,
         #[arg(long, default_value_t = 1)]
         warmup: usize,
+        #[arg(long, default_value = ".orient-index-bench")]
+        churn_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        churn_files: usize,
+        #[arg(long)]
+        keep_churn_files: bool,
         #[arg(long)]
         fail_p95_ms: Option<f64>,
         #[arg(long)]
@@ -1329,6 +1335,7 @@ enum BenchSearchMode {
 enum IndexBenchMode {
     Build,
     Refresh,
+    Churn,
 }
 
 impl std::fmt::Display for IndexBenchMode {
@@ -1336,6 +1343,7 @@ impl std::fmt::Display for IndexBenchMode {
         match self {
             IndexBenchMode::Build => formatter.write_str("build"),
             IndexBenchMode::Refresh => formatter.write_str("refresh"),
+            IndexBenchMode::Churn => formatter.write_str("churn"),
         }
     }
 }
@@ -1913,6 +1921,8 @@ struct IndexBenchSummary {
     source_bytes: u64,
     index_bytes: u64,
     index_to_source_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    churn_writes: Option<usize>,
     reused_files: usize,
     renamed_files: usize,
     refreshed_files: usize,
@@ -3755,6 +3765,9 @@ fn run() -> Result<()> {
             mode,
             runs,
             warmup,
+            churn_dir,
+            churn_files,
+            keep_churn_files,
             fail_p95_ms,
             fail_p99_ms,
         } => {
@@ -3764,6 +3777,9 @@ fn run() -> Result<()> {
                 mode,
                 runs,
                 warmup,
+                churn_dir,
+                churn_files,
+                cleanup: !keep_churn_files,
             })?;
             println!("{}", serde_json::to_string(&report)?);
             if let Some(threshold) = fail_p95_ms {
@@ -7611,26 +7627,59 @@ struct IndexBenchConfig {
     mode: IndexBenchMode,
     runs: usize,
     warmup: usize,
+    churn_dir: PathBuf,
+    churn_files: usize,
+    cleanup: bool,
 }
 
 fn bench_index(config: IndexBenchConfig) -> Result<IndexBenchReport> {
     let runs = config.runs.max(1);
-    if config.mode == IndexBenchMode::Refresh && !config.index.exists() {
+    let churn_files = config.churn_files.max(1);
+    if matches!(config.mode, IndexBenchMode::Refresh | IndexBenchMode::Churn)
+        && !config.index.exists()
+    {
         refresh_or_build_index(config.repo.clone(), config.index.clone())?;
     }
-    for _ in 0..config.warmup {
+    let churn_dir = if config.mode == IndexBenchMode::Churn {
+        Some(resolve_churn_dir(&config.repo, &config.churn_dir)?)
+    } else {
+        None
+    };
+    let mut cleanup_guard = churn_dir
+        .as_ref()
+        .map(|dir| ChurnCleanupGuard::new(config.cleanup, dir.clone(), churn_files));
+    let mut churn_writes = 0usize;
+
+    for wave_index in 0..config.warmup {
+        if let Some(churn_dir) = &churn_dir {
+            churn_writes += write_churn_files(churn_dir, wave_index, churn_files)?;
+        }
         run_index_bench_once(config.mode, &config.repo, &config.index)?;
     }
 
     let mut samples = Vec::with_capacity(runs);
-    for _ in 0..runs {
+    for run_index in 0..runs {
+        if let Some(churn_dir) = &churn_dir {
+            churn_writes += write_churn_files(churn_dir, config.warmup + run_index, churn_files)?;
+        }
         samples.push(run_index_bench_once(
             config.mode,
             &config.repo,
             &config.index,
         )?);
     }
-    let summary = summarize_index_bench(&samples);
+    if let Some(churn_dir) = &churn_dir {
+        if config.cleanup {
+            cleanup_churn_files(churn_dir, churn_files)?;
+        }
+    }
+    if let Some(guard) = &mut cleanup_guard {
+        guard.disarm();
+    }
+    let mut summary = summarize_index_bench(&samples);
+    if config.mode == IndexBenchMode::Churn {
+        summary.churn_writes = Some(churn_writes);
+    }
     Ok(IndexBenchReport {
         mode: config.mode.to_string(),
         runs,
@@ -7687,6 +7736,7 @@ fn summarize_index_bench(samples: &[IndexBenchSample]) -> IndexBenchSummary {
         } else {
             round_ratio(index_bytes as f64 / source_bytes as f64)
         },
+        churn_writes: None,
         reused_files: latest.map(|sample| sample.stats.reused_files).unwrap_or(0),
         renamed_files: latest.map(|sample| sample.stats.renamed_files).unwrap_or(0),
         refreshed_files: latest
