@@ -7768,8 +7768,14 @@ fn agent_bootstrap_contention_command(
     parts.push("20".to_string());
     parts.push("--warmup".to_string());
     parts.push("5".to_string());
+    parts.push("--fail-p99-p95-ratio".to_string());
+    parts.push("20".to_string());
     parts.push("--fail-fallback-rate".to_string());
     parts.push("0".to_string());
+    parts.push("--fail-daemon-rss-mb".to_string());
+    parts.push("2048".to_string());
+    parts.push("--fail-daemon-rss-source-ratio".to_string());
+    parts.push("64".to_string());
     for query in warm_queries {
         parts.push("--query".to_string());
         parts.push(shell_quote(query));

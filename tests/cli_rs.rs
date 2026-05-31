@@ -679,6 +679,11 @@ fn cli_outputs_agent_bootstrap_commands() {
         ))
         .stdout(predicate::str::contains(
             "orient bench-daemon-contend --addr '127.0.0.1:9999' --cwd '/work/repo-a' --cwd '/work/repo-b' --clients 10",
+        ))
+        .stdout(predicate::str::contains("--fail-p99-p95-ratio 20"))
+        .stdout(predicate::str::contains("--fail-daemon-rss-mb 2048"))
+        .stdout(predicate::str::contains(
+            "--fail-daemon-rss-source-ratio 64",
         ));
 
     let mut json = Command::cargo_bin("orient").unwrap();
@@ -721,6 +726,12 @@ fn cli_outputs_agent_bootstrap_commands() {
             .as_str()
             .unwrap()
             .contains("--cwd '/workspaces/repo-a'")
+    );
+    assert!(
+        report["contention_benchmark"]
+            .as_str()
+            .unwrap()
+            .contains("--fail-p99-p95-ratio 20")
     );
 }
 
