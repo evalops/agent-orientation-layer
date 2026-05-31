@@ -13,13 +13,23 @@ cd "${BUILD_WORKSPACE_DIRECTORY:-$(pwd)}"
 cargo build --release
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/orient-perf-gates.XXXXXX")"
-trap 'rm -rf "${tmpdir}"' EXIT
+daemon_pid=""
+cleanup() {
+  if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
+    kill "${daemon_pid}" 2>/dev/null || true
+    wait "${daemon_pid}" 2>/dev/null || true
+  fi
+  rm -rf "${tmpdir}"
+}
+trap cleanup EXIT
 index_path="${tmpdir}/orient.index"
 fallback_bench="${tmpdir}/orient-fallback-bench.json"
 indexed_bench="${tmpdir}/orient-indexed-bench.json"
 shard_dir="${tmpdir}/orient-shards"
 route_workspace="${tmpdir}/route-workspace"
 route_shard_dir="${tmpdir}/route-shards"
+churn_repo="${tmpdir}/churn-repo"
+churn_shard_dir="${tmpdir}/churn-shards"
 
 target/release/orient bench-search \
   --repo . \
@@ -148,3 +158,63 @@ target/release/orient bench-shards \
   --limit 10 \
   --fail-p95-ms 50 \
   "symbol:RouteSymbolManager token"
+
+mkdir -p "${churn_repo}/src" "${churn_repo}/.git"
+cat > "${churn_repo}/Cargo.toml" <<'EOF'
+[package]
+name = "orient-churn-gate"
+version = "0.1.0"
+edition = "2024"
+EOF
+cat > "${churn_repo}/src/lib.rs" <<'EOF'
+pub fn baseline_search_token() -> &'static str { "baseline" }
+EOF
+
+target/release/orient ensure-shards \
+  --repo "${churn_repo}" \
+  --output-dir "${churn_shard_dir}"
+
+daemon_addr="${ORIENT_PERF_GATES_DAEMON_ADDR:-127.0.0.1:8795}"
+daemon_log="${tmpdir}/orient-daemon-churn.log"
+target/release/orient serve-tcp \
+  --addr "${daemon_addr}" \
+  --index-dir "${churn_shard_dir}" \
+  --warm-repo "${churn_repo}" \
+  --max-cached-indexes 2 \
+  >"${daemon_log}" 2>&1 &
+daemon_pid="$!"
+
+daemon_ready=0
+for _ in $(seq 1 60); do
+  if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+    | target/release/orient client-jsonl --addr "${daemon_addr}" --require-version >/dev/null 2>&1; then
+    daemon_ready=1
+    break
+  fi
+  if ! kill -0 "${daemon_pid}" 2>/dev/null; then
+    echo "daemon exited before churn gate readiness" >&2
+    cat "${daemon_log}" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+if [[ "${daemon_ready}" != "1" ]]; then
+  echo "daemon did not become ready for churn gate at ${daemon_addr}" >&2
+  cat "${daemon_log}" >&2 || true
+  exit 1
+fi
+
+target/release/orient bench-daemon-churn \
+  --addr "${daemon_addr}" \
+  --cwd "${churn_repo}" \
+  --concurrency 4 \
+  --runs 5 \
+  --warmup 2 \
+  --baseline-runs 2 \
+  --churn-files 2 \
+  --limit 10 \
+  --request-timeout-ms 30000 \
+  --fail-p95-ms 1000 \
+  --fail-fallback-rate 0 \
+  --fail-refresh-overhead-ms 250 \
+  --query "orient_churn_token"

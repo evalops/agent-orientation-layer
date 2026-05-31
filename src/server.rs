@@ -1062,6 +1062,7 @@ pub struct ToolRuntime {
         Mutex<HashMap<ShardQueryPlanKey, CachedCompletedWork<ShardRouteStats>>>,
     completed_shard_freshness:
         Mutex<HashMap<ShardFreshnessKey, CachedTimedCompletedWork<ShardFreshness>>>,
+    shard_refresh_lock: Mutex<()>,
     coalesced_shard_search_waiters: AtomicU64,
     coalesced_shard_query_plan_waiters: AtomicU64,
     completed_shard_search_hits: AtomicU64,
@@ -1092,6 +1093,7 @@ impl Default for ToolRuntime {
             completed_shard_query_plans: Mutex::new(HashMap::new()),
             completed_shard_route_stats: Mutex::new(HashMap::new()),
             completed_shard_freshness: Mutex::new(HashMap::new()),
+            shard_refresh_lock: Mutex::new(()),
             coalesced_shard_search_waiters: AtomicU64::new(0),
             coalesced_shard_query_plan_waiters: AtomicU64::new(0),
             completed_shard_search_hits: AtomicU64::new(0),
@@ -7497,6 +7499,13 @@ impl ToolRuntime {
         if !shard_status(index_dir)?.stale {
             return Ok(());
         }
+        let _guard = self
+            .shard_refresh_lock
+            .lock()
+            .map_err(|_| anyhow!("shard refresh lock poisoned"))?;
+        if !shard_status(index_dir)?.stale {
+            return Ok(());
+        }
         refresh_shards(index_dir)?;
         self.clear_runtime_caches()
     }
@@ -7530,6 +7539,13 @@ impl ToolRuntime {
         roots.sort();
         roots.dedup();
         if roots.is_empty() || !shard_status_by_root(index_dir, &roots)?.stale {
+            return Ok(());
+        }
+        let _guard = self
+            .shard_refresh_lock
+            .lock()
+            .map_err(|_| anyhow!("shard refresh lock poisoned"))?;
+        if !shard_status_by_root(index_dir, &roots)?.stale {
             return Ok(());
         }
         refresh_shards_by_root(index_dir, &roots)?;

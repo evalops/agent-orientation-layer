@@ -1078,6 +1078,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_fallback_rate: Option<f64>,
+        #[arg(long)]
+        fail_refresh_overhead_ms: Option<f64>,
     },
     BenchDaemonContend {
         #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
@@ -6097,6 +6099,7 @@ fn run() -> Result<()> {
             keep_churn_files,
             fail_p95_ms,
             fail_fallback_rate,
+            fail_refresh_overhead_ms,
         } => {
             let filters = search_filters_from_args(&filters, repo_filter)?;
             let operations = cli_benchmark_churn_operations(query_args, range_args)?;
@@ -6121,6 +6124,9 @@ fn run() -> Result<()> {
             }
             if let Some(threshold) = fail_fallback_rate {
                 fail_bench_fallback_rate(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_refresh_overhead_ms {
+                fail_bench_refresh_overhead(&report, threshold)?;
             }
         }
         Commands::BenchDaemonContend {
@@ -9409,6 +9415,20 @@ fn fail_bench_fallback_rate(report: &BenchReport, threshold: f64) -> Result<()> 
         bail!(
             "fallback rate {:.3} exceeded threshold {:.3}",
             fallback_rate,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_bench_refresh_overhead(report: &BenchReport, threshold: f64) -> Result<()> {
+    let Some(refresh_overhead) = report.summary.refresh_overhead_max_p95_ms else {
+        bail!("refresh overhead is unavailable; run the benchmark with --baseline-runs > 0");
+    };
+    if refresh_overhead > threshold {
+        bail!(
+            "refresh overhead p95 {:.3}ms exceeded threshold {:.3}ms",
+            refresh_overhead,
             threshold
         );
     }
