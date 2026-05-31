@@ -38,7 +38,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const INDEX_FORMAT_VERSION: u32 = 13;
+pub const INDEX_FORMAT_VERSION: u32 = 14;
 const INDEX_VERSION: u32 = INDEX_FORMAT_VERSION;
 const PREVIOUS_DISK_INDEX_VERSION: u32 = 12;
 const OLDER_DISK_INDEX_VERSION: u32 = 11;
@@ -1315,6 +1315,16 @@ impl FastIndex {
         limit: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>> {
+        self.search_filtered_with_candidate_cap(query, limit, filters, None)
+    }
+
+    pub(crate) fn search_filtered_with_candidate_cap(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: &SearchFilters,
+        candidate_cap_override: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
         let limit = capped_search_limit(limit);
         let parsed = parse_query(query);
         let query_phrases = query_phrases(&parsed.terms);
@@ -1509,7 +1519,9 @@ impl FastIndex {
             indexed_filter_candidate_ids(&self.files, candidate_ids, &filters);
         let filtered_candidate_count = filtered_candidate_ids.len();
         let facet_candidate_ids = filtered_candidate_ids.clone();
-        let candidate_cap = indexed_candidate_cap(limit);
+        let candidate_cap = candidate_cap_override
+            .unwrap_or_else(|| indexed_candidate_cap(limit))
+            .clamp(1, MAX_INDEX_CANDIDATES_TO_SCORE);
         let (filtered_candidate_ids, candidate_cap_hit) = cap_candidate_ids(
             filtered_candidate_ids,
             candidate_cap,

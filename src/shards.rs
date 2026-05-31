@@ -49,6 +49,9 @@ const SHARD_ROUTE_SHORT_FILTER_MIN_CHARS: usize = 2;
 pub const DEFAULT_MAX_SHARD_WORKERS: usize = 8;
 pub const MAX_SHARD_WORKERS_ENV: &str = "ORIENT_MAX_SHARD_WORKERS";
 const SHARD_SEARCH_EARLY_RESULT_FACTOR: usize = 4;
+const SHARD_INDEX_CANDIDATE_CAP_FACTOR: usize = 64;
+const SHARD_INDEX_MIN_CANDIDATE_CAP: usize = 256;
+const SHARD_INDEX_MAX_CANDIDATE_CAP: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifest {
@@ -1294,12 +1297,18 @@ fn search_shard_job_batch(
     jobs: &[ShardJob],
 ) -> Result<Vec<SearchResult>> {
     let mut results = Vec::new();
+    let candidate_cap = shard_index_candidate_cap(limit);
     for job in jobs {
         let index = FastIndex::load(index_dir.join(&job.shard.index))
             .with_context(|| format!("load shard {}", job.shard.index))?;
         for scope in &job.scopes {
             let scoped_filters = filters_for_shard_scope(filters, scope.path_prefix.as_deref());
-            for mut result in index.search_filtered(query, limit, &scoped_filters)? {
+            for mut result in index.search_filtered_with_candidate_cap(
+                query,
+                limit,
+                &scoped_filters,
+                Some(candidate_cap),
+            )? {
                 if let Some(prefix) = &scope.path_prefix {
                     if !result.path.starts_with(prefix) {
                         continue;
@@ -1323,6 +1332,7 @@ fn search_shard_job_batch_stream(
     stop: &AtomicBool,
     tx: &mpsc::Sender<ShardSearchMessage>,
 ) -> Result<()> {
+    let candidate_cap = shard_index_candidate_cap(limit);
     for job in jobs {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1335,7 +1345,12 @@ fn search_shard_job_batch_stream(
             }
             let scoped_filters = filters_for_shard_scope(filters, scope.path_prefix.as_deref());
             let mut batch = Vec::new();
-            for mut result in index.search_filtered(query, limit, &scoped_filters)? {
+            for mut result in index.search_filtered_with_candidate_cap(
+                query,
+                limit,
+                &scoped_filters,
+                Some(candidate_cap),
+            )? {
                 if let Some(prefix) = &scope.path_prefix {
                     if !result.path.starts_with(prefix) {
                         continue;
@@ -1351,6 +1366,13 @@ fn search_shard_job_batch_stream(
         }
     }
     Ok(())
+}
+
+pub(crate) fn shard_index_candidate_cap(limit: usize) -> usize {
+    limit
+        .max(1)
+        .saturating_mul(SHARD_INDEX_CANDIDATE_CAP_FACTOR)
+        .clamp(SHARD_INDEX_MIN_CANDIDATE_CAP, SHARD_INDEX_MAX_CANDIDATE_CAP)
 }
 
 pub fn shard_query_plans(
@@ -2480,14 +2502,14 @@ fn shard_query_identifier_prefilter(
     query_tokens: &[String],
     filters: &SearchFilters,
 ) -> Option<String> {
-    if filters.match_any || query_tokens.len() <= 1 || !shard_query.contains('_') {
+    if filters.match_any || query_tokens.is_empty() || !shard_query.contains('_') {
         return None;
     }
     if shard_query.split_whitespace().nth(1).is_some() {
         return None;
     }
     let normalized = normalize_token(shard_query);
-    (normalized.chars().count() > SHARD_SUBSTRING_PREFILTER_MAX_TOKEN_CHARS).then_some(normalized)
+    (normalized.chars().count() > 1).then_some(normalized)
 }
 
 fn shard_sketch_token_may_match(
@@ -2588,7 +2610,7 @@ fn push_identifier_hash(identifier: &mut String, exact_hashes: &mut Vec<u32>) {
             .is_some_and(|byte| byte.is_ascii_alphabetic())
     {
         let normalized = normalize_token(identifier);
-        if normalized.chars().count() > SHARD_SUBSTRING_PREFILTER_MAX_TOKEN_CHARS {
+        if normalized.chars().count() > 1 {
             exact_hashes.push(sketch_fingerprint(&normalized));
         }
     }
@@ -4565,6 +4587,14 @@ mod tests {
             !single_short_hashes.contains(&search_hash),
             "single short terms keep substring/trigram route behavior"
         );
+        let identifier_hash = sketch_fingerprint("readrange");
+        let (identifier_decisive_hashes, identifier_short_hashes) =
+            shard_prefilter_required_exact_hashes("read_range", &SearchFilters::default());
+        assert_eq!(identifier_decisive_hashes, vec![identifier_hash]);
+        assert!(
+            !identifier_short_hashes.contains(&identifier_hash),
+            "identifier-like query terms should route by normalized full identifier"
+        );
         let (multi_decisive_hashes, multi_short_hashes) =
             shard_prefilter_required_exact_hashes("search query plan", &SearchFilters::default());
         assert!(multi_decisive_hashes.is_empty());
@@ -4633,6 +4663,55 @@ mod tests {
         assert_eq!(
             shard_route_candidate_ids(&route, &exact_route_requirements(&[left_hash, right_hash])),
             ShardRouteLookup::Candidates((70..90).collect())
+        );
+    }
+
+    #[test]
+    fn manifest_route_uses_normalized_short_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_range_hash = sketch_fingerprint("readrange");
+        let read_hash = sketch_fingerprint("read");
+        let range_hash = sketch_fingerprint("range");
+        let shards = [
+            (0, vec![read_range_hash, read_hash, range_hash]),
+            (1, vec![read_hash, range_hash]),
+            (2, vec![read_hash]),
+            (3, vec![range_hash]),
+        ]
+        .into_iter()
+        .map(|(index, exact_hashes)| ShardEntry {
+            name: format!("repo-{index}"),
+            root: dir.path().join(format!("repo-{index}")),
+            index: format!("repo-{index}.orient"),
+            aliases: Vec::new(),
+            git: None,
+            sketch: Some(ShardQuerySketch {
+                exact_hashes,
+                trigram_hashes: Vec::new(),
+                exact_bits: Vec::new(),
+                trigram_bits: Vec::new(),
+                substring_bits: Vec::new(),
+                symbol_kind_bits: Vec::new(),
+                filter_bits: Vec::new(),
+            }),
+        })
+        .collect();
+        let manifest = ShardManifest {
+            version: SHARD_MANIFEST_VERSION,
+            shards,
+        };
+        save_manifest(dir.path(), &manifest).unwrap();
+
+        let stats =
+            shard_query_route_stats(dir.path(), "read_range", &SearchFilters::default()).unwrap();
+        assert_eq!(
+            stats,
+            ShardRouteStats {
+                status: "routed".to_string(),
+                routed: true,
+                total_shards: 4,
+                selected_shards: 1,
+            }
         );
     }
 
@@ -4820,6 +4899,14 @@ mod tests {
         assert_eq!(shard_early_result_target(0), 0);
         assert_eq!(shard_early_result_target(1), 4);
         assert_eq!(shard_early_result_target(10), 40);
+    }
+
+    #[test]
+    fn shard_index_candidate_cap_stays_bounded_for_wide_fanout() {
+        assert_eq!(shard_index_candidate_cap(0), 256);
+        assert_eq!(shard_index_candidate_cap(1), 256);
+        assert_eq!(shard_index_candidate_cap(10), 640);
+        assert_eq!(shard_index_candidate_cap(100), 1_024);
     }
 
     #[test]

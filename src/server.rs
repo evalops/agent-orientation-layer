@@ -26,10 +26,11 @@ use crate::shards::{
     build_shards_with_force, configured_max_shard_workers, ensure_shards,
     filter_repo_map_by_prefix, filters_for_shard_scope, load_manifest, refresh_shards,
     refresh_shards_by_root, related_query_without_shard_selectors,
-    resolve_shard_path_from_manifest, shard_early_result_target, shard_prefilter_query_impossible,
-    shard_query_route_stats, shard_route_entries, shard_route_selection, shard_search_scopes,
-    shard_selection_miss_plan, shard_sketch_may_diagnose_query, shard_sketch_may_match_query,
-    shard_status, shard_status_by_root,
+    resolve_shard_path_from_manifest, shard_early_result_target, shard_index_candidate_cap,
+    shard_prefilter_query_impossible, shard_query_route_stats, shard_route_entries,
+    shard_route_selection, shard_search_scopes, shard_selection_miss_plan,
+    shard_sketch_may_diagnose_query, shard_sketch_may_match_query, shard_status,
+    shard_status_by_root,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::{Context, Result, anyhow};
@@ -7839,11 +7840,17 @@ impl ToolRuntime {
         jobs: &[ShardJob],
     ) -> Result<Vec<SearchResult>> {
         let mut results = Vec::new();
+        let candidate_cap = shard_index_candidate_cap(limit);
         for job in jobs {
             let index = self.cached_index(index_dir.join(&job.shard.index))?;
             for scope in &job.scopes {
                 let scoped_filters = filters_for_shard_scope(filters, scope.path_prefix.as_deref());
-                for mut result in index.search_filtered(query, limit, &scoped_filters)? {
+                for mut result in index.search_filtered_with_candidate_cap(
+                    query,
+                    limit,
+                    &scoped_filters,
+                    Some(candidate_cap),
+                )? {
                     if let Some(prefix) = &scope.path_prefix {
                         if !result.path.starts_with(prefix) {
                             continue;
@@ -7868,6 +7875,7 @@ impl ToolRuntime {
         stop: &AtomicBool,
         tx: &mpsc::Sender<CachedShardSearchMessage>,
     ) -> Result<()> {
+        let candidate_cap = shard_index_candidate_cap(limit);
         for job in jobs {
             if stop.load(AtomicOrdering::Relaxed) {
                 break;
@@ -7879,7 +7887,12 @@ impl ToolRuntime {
                 }
                 let scoped_filters = filters_for_shard_scope(filters, scope.path_prefix.as_deref());
                 let mut batch = Vec::new();
-                for mut result in index.search_filtered(query, limit, &scoped_filters)? {
+                for mut result in index.search_filtered_with_candidate_cap(
+                    query,
+                    limit,
+                    &scoped_filters,
+                    Some(candidate_cap),
+                )? {
                     if let Some(prefix) = &scope.path_prefix {
                         if !result.path.starts_with(prefix) {
                             continue;

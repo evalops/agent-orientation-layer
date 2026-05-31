@@ -94,10 +94,13 @@ for index in $(seq 0 95); do
   mkdir -p "${repo}/src"
   cat > "${repo}/src/lib.rs" <<EOF
 pub fn commonroutegate() -> usize { ${index} }
+pub fn read() -> usize { ${index} }
+pub fn range() -> usize { ${index} }
 EOF
 done
 cat >> "${route_workspace}/route-repo-42/src/lib.rs" <<'EOF'
 pub fn unique42needle() -> usize { 42 }
+pub fn read_range() -> usize { 42 }
 EOF
 
 target/release/orient ensure-shards \
@@ -116,3 +119,16 @@ target/release/orient bench-shards \
   --limit 10 \
   --fail-p95-ms 50 \
   "kind:function unique42needle"
+target/release/orient search \
+  --index-dir "${route_shard_dir}" \
+  --query "read_range" \
+  --limit 10 \
+  | grep -q "route-repo-42/src/lib.rs"
+target/release/orient bench-shards \
+  --index-dir "${route_shard_dir}" \
+  --cold \
+  --runs 5 \
+  --warmup 1 \
+  --limit 10 \
+  --fail-p95-ms 50 \
+  "read_range"
