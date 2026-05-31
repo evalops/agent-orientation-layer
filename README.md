@@ -192,6 +192,7 @@ bazel test //...
 bazel run //:ci_full_test
 bazel run //:ci_perf_gates
 ORIENT_WIDE_SHARDS=0 bazel run //:ci_wide_perf
+ORIENT_AGENT_ROOT=/path/to/projects tools/ci/orient_agent_query_perf.sh
 ```
 
 The wide perf gate chooses the local projects workspace when it exists, then
@@ -207,6 +208,7 @@ slowest query. Use `--fail-p95-ms` for hard gates and `--baseline` /
 
 - [Shared daemon guide](docs/shared-daemon.md)
 - [Storage and footprint](docs/storage-footprint.md)
+- [Benchmarking](docs/benchmarking.md)
 - [Agent adoption](docs/agent-adoption.md)
 - [Agent protocol](docs/agent-protocol.md)
 - [Fast search roadmap](docs/fast-search-roadmap.md)
