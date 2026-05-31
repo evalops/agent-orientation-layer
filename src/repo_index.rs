@@ -8669,15 +8669,15 @@ pub(crate) fn repo_matches(root: &Path, filters: &SearchFilters) -> bool {
         .unwrap_or_else(|| root.display().to_string());
     let repo_root = root.to_string_lossy().to_ascii_lowercase();
     if let Some(filter) = &filters.repo {
-        let filter = filter.to_ascii_lowercase();
-        if !repo_name.contains(&filter) && !repo_root.contains(&filter) {
+        if !repo_filter_matches(root, &repo_name, &repo_root, filter) {
             return false;
         }
     }
-    if filters.exclude_repo.iter().any(|filter| {
-        let filter = filter.to_ascii_lowercase();
-        repo_name.contains(&filter) || repo_root.contains(&filter)
-    }) {
+    if filters
+        .exclude_repo
+        .iter()
+        .any(|filter| repo_filter_matches(root, &repo_name, &repo_root, filter))
+    {
         return false;
     }
 
@@ -8712,6 +8712,18 @@ pub(crate) fn repo_matches(root: &Path, filters: &SearchFilters) -> bool {
         return false;
     }
     true
+}
+
+fn repo_filter_matches(root: &Path, repo_name: &str, repo_root: &str, filter: &str) -> bool {
+    let filter_path = Path::new(filter);
+    if filter_path.is_absolute() {
+        return root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+            == filter_path
+                .canonicalize()
+                .unwrap_or_else(|_| filter_path.to_path_buf());
+    }
+    let filter = filter.to_ascii_lowercase();
+    repo_name.contains(&filter) || repo_root.contains(&filter)
 }
 
 fn metadata_value_matches(value: Option<&str>, filter: &str) -> bool {

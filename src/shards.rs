@@ -4046,6 +4046,9 @@ fn push_alias(
 }
 
 fn shard_identity_matches(shard: &ShardEntry, filter: &str) -> bool {
+    if Path::new(filter).is_absolute() {
+        return absolute_shard_filter_matches_root(&shard.root, filter);
+    }
     contains_ascii_case_insensitive(&shard.name, filter)
         || shard
             .root
@@ -4061,7 +4064,18 @@ fn shard_identity_matches(shard: &ShardEntry, filter: &str) -> bool {
 }
 
 fn alias_matches(alias: &ShardAlias, filter: &str) -> bool {
+    if Path::new(filter).is_absolute() {
+        return false;
+    }
     contains_ascii_case_insensitive(&alias.name, filter)
+}
+
+fn absolute_shard_filter_matches_root(root: &Path, filter: &str) -> bool {
+    let filter_path = Path::new(filter);
+    if let Ok(filter_root) = filter_path.canonicalize() {
+        return root.canonicalize().unwrap_or_else(|_| root.to_path_buf()) == filter_root;
+    }
+    root == filter_path
 }
 
 fn git_metadata_matches(git: &RepoGitMetadata, filter: &str) -> bool {

@@ -133,7 +133,7 @@ run_case() {
   shift
 
   local daemon_log
-  daemon_log="$(mktemp "${TMPDIR:-/tmp}/orient-daemon-contend.XXXXXX.log")"
+  daemon_log="$(mktemp "${TMPDIR:-/tmp}/orient-daemon-contend.XXXXXX")"
   local daemon_pid=""
   cleanup_case() {
     if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then

@@ -1547,6 +1547,7 @@ impl FastIndex {
                     filters.target_line,
                     filters.explain,
                     filters.symbol.as_deref(),
+                    filters.symbol_kind.as_deref(),
                     allow_implicit_symbol_score,
                     filters.generated.is_none(),
                     None,
@@ -2149,6 +2150,7 @@ impl FastIndex {
                     filters.target_line,
                     false,
                     filters.symbol.as_deref(),
+                    filters.symbol_kind.as_deref(),
                     allow_implicit_symbol_score,
                     filters.generated.is_none(),
                     None,
@@ -2296,6 +2298,7 @@ impl FastIndex {
         target_line: Option<usize>,
         explain: bool,
         symbol_filter: Option<&str>,
+        symbol_kind_filter: Option<&str>,
         allow_implicit_symbol_score: bool,
         demote_generated: bool,
         query_plan: Option<&QueryPlan>,
@@ -2363,6 +2366,9 @@ impl FastIndex {
         }
         if allow_implicit_symbol_score {
             for symbol in &file.symbols {
+                if !indexed_symbol_matches_score_filters(symbol, None, symbol_kind_filter) {
+                    continue;
+                }
                 if let Some((kind, amount)) = symbol_query_match_score(
                     &symbol.normalized,
                     &symbol.tokens,
@@ -2373,6 +2379,16 @@ impl FastIndex {
                     reasons.push(format!("symbol:{}", symbol.name));
                     signals.push(rank_signal(kind, &symbol.name, amount));
                 }
+            }
+        }
+        if let Some(symbol) =
+            symbol_filter.and_then(|wanted| indexed_symbol_filter_symbol(file, wanted))
+        {
+            let reason = format!("symbol:{}", symbol.name);
+            if !reasons.iter().any(|existing| existing == &reason) {
+                score += 44.0;
+                reasons.push(reason);
+                signals.push(rank_signal("symbol_filter", &symbol.name, 44.0));
             }
         }
         if score == 0.0 {
@@ -2390,17 +2406,49 @@ impl FastIndex {
         }
 
         let symbol_line = symbol_filter.and_then(|wanted| indexed_symbol_filter_line(file, wanted));
+        let symbol_kind_line =
+            symbol_kind_filter.and_then(|wanted| indexed_symbol_kind_filter_line(file, wanted));
         let snippet_line = target_line.or(symbol_line);
         let snippet = snippet_line
             .and_then(|line| indexed_symbol_filter_snippet(file, line, snippet_mode))
-            .unwrap_or_else(|| indexed_snippet(file, query_tokens, query_phrases, snippet_mode));
-        let mut match_lines = indexed_match_lines(file, query_tokens, query_phrases, 16);
+            .or_else(|| {
+                symbol_kind_line.and_then(|line| {
+                    target_line
+                        .is_none()
+                        .then(|| indexed_symbol_filter_snippet(file, line, snippet_mode))
+                        .flatten()
+                })
+            })
+            .unwrap_or_else(|| {
+                indexed_snippet(
+                    file,
+                    query_tokens,
+                    query_phrases,
+                    snippet_mode,
+                    symbol_filter,
+                    symbol_kind_filter,
+                )
+            });
+        let mut match_lines = indexed_match_lines(
+            file,
+            query_tokens,
+            query_phrases,
+            16,
+            symbol_filter,
+            symbol_kind_filter,
+        );
         if let Some(line) = target_line {
             match_lines.retain(|match_line| *match_line != line);
             match_lines.insert(0, line);
         }
         if target_line.is_none()
             && let Some(line) = symbol_line
+        {
+            match_lines.retain(|match_line| *match_line != line);
+            match_lines.insert(0, line);
+        } else if target_line.is_none()
+            && symbol_line.is_none()
+            && let Some(line) = symbol_kind_line
         {
             match_lines.retain(|match_line| *match_line != line);
             match_lines.insert(0, line);
@@ -5431,6 +5479,8 @@ fn indexed_match_lines(
     query_tokens: &[String],
     query_phrases: &[String],
     limit: usize,
+    symbol_filter: Option<&str>,
+    symbol_kind_filter: Option<&str>,
 ) -> Vec<usize> {
     if (query_tokens.is_empty() && query_phrases.is_empty()) || limit == 0 {
         return Vec::new();
@@ -5441,6 +5491,8 @@ fn indexed_match_lines(
         &file.line_offsets,
         query_tokens,
         query_phrases,
+        symbol_filter,
+        symbol_kind_filter,
     )
     .into_iter()
     .collect::<Vec<_>>();
@@ -5512,6 +5564,8 @@ fn indexed_snippet(
     query_tokens: &[String],
     query_phrases: &[String],
     mode: SnippetMode,
+    symbol_filter: Option<&str>,
+    symbol_kind_filter: Option<&str>,
 ) -> String {
     let bytes = file.content.as_bytes();
     if bytes.is_empty() || file.line_offsets.is_empty() {
@@ -5523,6 +5577,9 @@ fn indexed_snippet(
         if let Some(line) = file
             .symbols
             .iter()
+            .filter(|symbol| {
+                indexed_symbol_matches_score_filters(symbol, symbol_filter, symbol_kind_filter)
+            })
             .find(|symbol| {
                 symbol.normalized == query_name
                     || symbol
@@ -5542,6 +5599,8 @@ fn indexed_snippet(
         &file.line_offsets,
         query_tokens,
         query_phrases,
+        symbol_filter,
+        symbol_kind_filter,
     ) {
         return render_indexed_window(&bytes, &file.line_offsets, line, mode);
     }
@@ -5551,9 +5610,31 @@ fn indexed_snippet(
 }
 
 fn indexed_symbol_filter_line(file: &IndexedPath, wanted: &str) -> Option<usize> {
+    indexed_symbol_filter_symbol(file, wanted).map(|symbol| symbol.line)
+}
+
+fn indexed_symbol_filter_symbol<'a>(
+    file: &'a IndexedPath,
+    wanted: &str,
+) -> Option<&'a IndexedSymbol> {
     file.symbols
         .iter()
         .find(|symbol| symbol_filter_matches_name(&symbol.name, wanted))
+}
+
+fn indexed_symbol_matches_score_filters(
+    symbol: &IndexedSymbol,
+    symbol_filter: Option<&str>,
+    symbol_kind_filter: Option<&str>,
+) -> bool {
+    symbol_filter.is_none_or(|wanted| symbol_filter_matches_name(&symbol.name, wanted))
+        && symbol_kind_filter.is_none_or(|wanted| symbol.kind.eq_ignore_ascii_case(wanted))
+}
+
+fn indexed_symbol_kind_filter_line(file: &IndexedPath, wanted: &str) -> Option<usize> {
+    file.symbols
+        .iter()
+        .find(|symbol| symbol.kind.eq_ignore_ascii_case(wanted))
         .map(|symbol| symbol.line)
 }
 
@@ -5588,11 +5669,21 @@ fn best_matching_line(
     offsets: &[u32],
     query_tokens: &[String],
     query_phrases: &[String],
+    symbol_filter: Option<&str>,
+    symbol_kind_filter: Option<&str>,
 ) -> Option<usize> {
-    indexed_line_scores(file, bytes, offsets, query_tokens, query_phrases)
-        .into_iter()
-        .max_by_key(|(line, score)| (*score, std::cmp::Reverse(*line)))
-        .map(|(line, _)| line)
+    indexed_line_scores(
+        file,
+        bytes,
+        offsets,
+        query_tokens,
+        query_phrases,
+        symbol_filter,
+        symbol_kind_filter,
+    )
+    .into_iter()
+    .max_by_key(|(line, score)| (*score, std::cmp::Reverse(*line)))
+    .map(|(line, _)| line)
 }
 
 fn indexed_line_scores(
@@ -5601,6 +5692,8 @@ fn indexed_line_scores(
     offsets: &[u32],
     query_tokens: &[String],
     query_phrases: &[String],
+    symbol_filter: Option<&str>,
+    symbol_kind_filter: Option<&str>,
 ) -> HashMap<usize, usize> {
     let mut scores = HashMap::<usize, usize>::new();
     for token in query_tokens {
@@ -5637,6 +5730,9 @@ fn indexed_line_scores(
     }
     let query_name = query_tokens.join("");
     for symbol in &file.symbols {
+        if !indexed_symbol_matches_score_filters(symbol, symbol_filter, symbol_kind_filter) {
+            continue;
+        }
         if let Some((kind, amount)) = symbol_query_match_score(
             &symbol.normalized,
             &symbol.tokens,

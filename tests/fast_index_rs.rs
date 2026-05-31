@@ -1271,6 +1271,44 @@ fn indexed_query_plan_suggests_any_terms_for_strict_and_misses() {
 }
 
 #[test]
+fn absolute_repo_filters_match_exact_roots_not_name_prefixes() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("maestro");
+    let sibling = workspace.path().join("maestro-internal");
+    write(&repo.join("src/lib.rs"), "pub fn handler() {}\n");
+    write(&sibling.join("src/lib.rs"), "pub fn handler() {}\n");
+
+    let exact_root = repo.canonicalize().unwrap().to_string_lossy().to_string();
+    let repo_index = FastIndex::build(&repo).unwrap();
+    let sibling_index = FastIndex::build(&sibling).unwrap();
+    let filters = SearchFilters {
+        repo: Some(exact_root),
+        ..SearchFilters::default()
+    };
+
+    assert_eq!(
+        repo_index
+            .search_filtered("handler", 10, &filters)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        sibling_index
+            .search_filtered("handler", 10, &filters)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        sibling_index
+            .query_plan("handler", &filters)
+            .unwrap()
+            .strategy,
+        "repo_filter_mismatch"
+    );
+}
+
+#[test]
 fn indexed_query_plan_suggests_facets_for_noisy_successful_queries() {
     let repo = tempfile::tempdir().unwrap();
     for index in 0..5 {
@@ -4434,6 +4472,70 @@ fn indexed_kind_filter_snippets_anchor_on_matching_symbol_line() {
     assert_eq!(results[0].match_lines, vec![6]);
     assert_eq!(results[0].line_range.as_ref().unwrap().start_line, 6);
     assert_eq!(results[0].line_range.as_ref().unwrap().end_line, 6);
+}
+
+#[test]
+fn indexed_kind_filter_query_scoring_ignores_other_symbol_kinds() {
+    let repo = tempfile::tempdir().unwrap();
+    let mut source = "pub struct HandlerState;\n".to_string();
+    for line in 2..=24 {
+        source.push_str(&format!("// filler line {line}\n"));
+    }
+    source.push_str("pub fn handler_endpoint() -> bool { true }\n");
+    write(&repo.path().join("src/lib.rs"), &source);
+
+    let index = FastIndex::build(repo.path()).unwrap();
+    let results = index
+        .search_filtered(
+            "kind:function handler",
+            5,
+            &SearchFilters {
+                snippet: SnippetMode::Short,
+                ..SearchFilters::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(results[0].path, "src/lib.rs");
+    assert!(results[0].snippet.contains("pub fn handler_endpoint()"));
+    assert!(!results[0].snippet.contains("pub struct HandlerState"));
+    assert!(results[0].reason.contains("symbol:handler_endpoint"));
+    assert!(!results[0].reason.contains("symbol:HandlerState"));
+    assert_eq!(results[0].match_lines.first().copied(), Some(25));
+}
+
+#[test]
+fn indexed_symbol_and_kind_filters_can_score_different_symbols_in_same_file() {
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        &repo.path().join("src/auth.rs"),
+        r#"
+pub struct SessionManager;
+
+impl SessionManager {
+    pub fn issue_token(user_id: &str) -> String {
+        format!("token-{user_id}")
+    }
+}
+"#,
+    );
+
+    let index = FastIndex::build(repo.path()).unwrap();
+    let results = index
+        .search_filtered(
+            "issue token",
+            5,
+            &SearchFilters {
+                symbol: Some("SessionManager".to_string()),
+                symbol_kind: Some("function".to_string()),
+                require_all: true,
+                ..SearchFilters::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(results[0].path, "src/auth.rs");
+    assert!(results[0].reason.contains("symbol:issue_token"));
 }
 
 #[test]

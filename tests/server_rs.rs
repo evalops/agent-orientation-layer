@@ -8874,6 +8874,58 @@ fn runtime_search_auto_scopes_warmed_shards_to_client_cwd() {
 }
 
 #[test]
+fn runtime_search_auto_scopes_absolute_cwd_to_exact_prefix_sibling_shard() {
+    let workspace = tempfile::tempdir().unwrap();
+    let current_repo = workspace.path().join("maestro");
+    let sibling_repo = workspace.path().join("maestro-internal");
+    fs::create_dir_all(current_repo.join(".git")).unwrap();
+    fs::create_dir_all(sibling_repo.join(".git")).unwrap();
+    write(
+        &current_repo.join("src/lib.rs"),
+        "pub fn shared_prefix_lookup_token() -> &'static str { \"current\" }\n",
+    );
+    write(
+        &sibling_repo.join("src/lib.rs"),
+        "pub fn shared_prefix_lookup_token() -> &'static str { \"sibling\" }\n",
+    );
+    let shard_dir = workspace.path().join("shards");
+    build_shards(
+        &[PathBuf::from(&current_repo), PathBuf::from(&sibling_repo)],
+        &shard_dir,
+    )
+    .unwrap();
+
+    let runtime = ToolRuntime::default();
+    runtime.warm_shards(shard_dir.clone()).unwrap();
+
+    let search = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("search-auto-prefix-cwd"),
+        tool: "search_auto".to_string(),
+        arguments: serde_json::json!({
+            "cwd": current_repo.join("src"),
+            "query": "shared_prefix_lookup_token",
+            "limit": 5
+        }),
+    });
+    assert!(search.error.is_none(), "{:?}", search.error);
+    let value = search.result.unwrap();
+    assert_eq!(
+        value["summary"]["shard_route"]["selected_shards"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        value["query_plan_request"]["arguments"]["repo_filter"],
+        serde_json::json!(current_repo.canonicalize().unwrap().to_string_lossy())
+    );
+    let serialized = serde_json::to_string(&value).unwrap();
+    assert!(serialized.contains("maestro/src/lib.rs"), "{serialized}");
+    assert!(
+        !serialized.contains("maestro-internal/src/lib.rs"),
+        "{serialized}"
+    );
+}
+
+#[test]
 fn runtime_search_auto_refreshes_only_client_cwd_shard_when_scoped() {
     let workspace = tempfile::tempdir().unwrap();
     let current_repo = workspace.path().join("current-app");
