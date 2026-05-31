@@ -10150,6 +10150,172 @@ fn runtime_coalesces_parallel_empty_shard_query_plans() {
 }
 
 #[test]
+fn runtime_caches_repeated_warm_shard_searches() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for index in 0..4 {
+        let repo = root.path().join(format!("service_{index}"));
+        write(
+            &repo.join("src/lib.rs"),
+            &format!("pub fn shared_search_token_{index}() -> usize {{ {index} }}\n"),
+        );
+        write(
+            &repo.join("Cargo.toml"),
+            &format!("[package]\nname='service-{index}'\nversion='0.1.0'\nedition='2024'\n"),
+        );
+        repos.push(repo);
+    }
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+
+    let runtime = ToolRuntime::default();
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+    runtime.warm_shards(shard_dir.path().to_path_buf()).unwrap();
+
+    let first = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("first"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "shared search token",
+            "limit": 5,
+            "require_all": true
+        }),
+    });
+    assert!(first.error.is_none(), "{:?}", first.error);
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 1);
+    let first_result = serde_json::to_string(&first.result).unwrap();
+    assert!(
+        first_result.contains("shared_search_token"),
+        "{first_result}"
+    );
+
+    let hits_before = runtime.completed_shard_search_cache_hit_count();
+    let second = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("second"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "shared search token",
+            "limit": 5,
+            "require_all": true
+        }),
+    });
+    assert!(second.error.is_none(), "{:?}", second.error);
+    assert!(
+        runtime.completed_shard_search_cache_hit_count() > hits_before,
+        "repeated warm shard searches should reuse completed fanout results"
+    );
+}
+
+#[test]
+fn runtime_caches_repeated_empty_shard_query_plans() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for index in 0..4 {
+        let repo = root.path().join(format!("service_{index}"));
+        write(
+            &repo.join("src/lib.rs"),
+            &format!("pub fn present_search_token_{index}() -> usize {{ {index} }}\n"),
+        );
+        write(
+            &repo.join("Cargo.toml"),
+            &format!("[package]\nname='service-{index}'\nversion='0.1.0'\nedition='2024'\n"),
+        );
+        repos.push(repo);
+    }
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+
+    let runtime = ToolRuntime::default();
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+
+    let request = || ToolRequest {
+        id: serde_json::json!("miss"),
+        tool: "search_auto".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "missing_search_token",
+            "limit": 5,
+            "require_all": true
+        }),
+    };
+    let first = runtime.dispatch(request());
+    assert!(first.error.is_none(), "{:?}", first.error);
+    assert_eq!(
+        first.result.as_ref().unwrap()["summary"]["result_count"],
+        serde_json::json!(0)
+    );
+    assert!(
+        first
+            .result
+            .as_ref()
+            .unwrap()
+            .get("query_plan_result")
+            .is_some()
+    );
+
+    let hits_before = runtime.completed_shard_query_plan_cache_hit_count();
+    let second = runtime.dispatch(request());
+    assert!(second.error.is_none(), "{:?}", second.error);
+    assert!(
+        runtime.completed_shard_query_plan_cache_hit_count() > hits_before,
+        "repeated miss diagnostics should reuse completed shard query plans"
+    );
+}
+
+#[test]
+fn runtime_clears_completed_shard_search_cache_on_refresh() {
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        &repo.path().join("src/lib.rs"),
+        "pub fn shared_search_token() -> usize { 1 }\n",
+    );
+    write(
+        &repo.path().join("Cargo.toml"),
+        "[package]\nname='service'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&[repo.path().to_path_buf()], shard_dir.path()).unwrap();
+
+    let runtime = ToolRuntime::default();
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+    let search = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("search"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "shared search token",
+            "limit": 5,
+            "require_all": true
+        }),
+    });
+    assert!(search.error.is_none(), "{:?}", search.error);
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 1);
+
+    thread::sleep(Duration::from_millis(20));
+    write(
+        &repo.path().join("src/lib.rs"),
+        "pub fn shared_search_token() -> usize { 1 }\npub fn fresh_search_token() -> usize { 2 }\n",
+    );
+    let refresh = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("refresh"),
+        tool: "refresh_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path()
+        }),
+    });
+    assert!(refresh.error.is_none(), "{:?}", refresh.error);
+    assert_eq!(runtime.completed_shard_search_cache_entry_count(), 0);
+}
+
+#[test]
 fn runtime_bounds_lazy_shard_index_cache() {
     let workspace = tempfile::tempdir().unwrap();
     let auth_repo = workspace.path().join("auth");

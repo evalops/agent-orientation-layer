@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
+use std::hash::Hash;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,7 @@ use std::time::SystemTime;
 pub const MAX_BATCH_QUERIES: usize = 32;
 pub const MAX_BATCH_RANGES: usize = 64;
 pub const DEFAULT_MAX_CACHED_INDEXES: usize = 64;
+const MAX_COMPLETED_SHARD_WORK_CACHE: usize = 128;
 const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8796";
 const MAX_DAEMON_SHARD_WORKERS_ENV: &str = "ORIENT_MAX_DAEMON_SHARD_WORKERS";
 
@@ -1049,8 +1051,18 @@ pub struct ToolRuntime {
     inflight_shard_searches: Mutex<HashMap<ShardSearchKey, Arc<InFlightWork<Vec<SearchResult>>>>>,
     inflight_shard_query_plans:
         Mutex<HashMap<ShardQueryPlanKey, Arc<InFlightWork<Vec<ShardQueryPlan>>>>>,
+    completed_shard_searches:
+        Mutex<HashMap<ShardSearchKey, CachedCompletedWork<Vec<SearchResult>>>>,
+    completed_shard_query_plans:
+        Mutex<HashMap<ShardQueryPlanKey, CachedCompletedWork<Vec<ShardQueryPlan>>>>,
+    completed_shard_route_stats:
+        Mutex<HashMap<ShardQueryPlanKey, CachedCompletedWork<ShardRouteStats>>>,
     coalesced_shard_search_waiters: AtomicU64,
     coalesced_shard_query_plan_waiters: AtomicU64,
+    completed_shard_search_hits: AtomicU64,
+    completed_shard_query_plan_hits: AtomicU64,
+    completed_shard_cache_epoch: AtomicU64,
+    next_completed_shard_cache_access: AtomicU64,
     next_index_access: AtomicU64,
     cache_policy: IndexCachePolicy,
     shard_worker_pool: ShardWorkerPool,
@@ -1069,8 +1081,15 @@ impl Default for ToolRuntime {
             shard_manifests: Mutex::new(HashMap::new()),
             inflight_shard_searches: Mutex::new(HashMap::new()),
             inflight_shard_query_plans: Mutex::new(HashMap::new()),
+            completed_shard_searches: Mutex::new(HashMap::new()),
+            completed_shard_query_plans: Mutex::new(HashMap::new()),
+            completed_shard_route_stats: Mutex::new(HashMap::new()),
             coalesced_shard_search_waiters: AtomicU64::new(0),
             coalesced_shard_query_plan_waiters: AtomicU64::new(0),
+            completed_shard_search_hits: AtomicU64::new(0),
+            completed_shard_query_plan_hits: AtomicU64::new(0),
+            completed_shard_cache_epoch: AtomicU64::new(1),
+            next_completed_shard_cache_access: AtomicU64::new(1),
             next_index_access: AtomicU64::new(1),
             cache_policy: IndexCachePolicy::default(),
             shard_worker_pool: ShardWorkerPool::new(configured_max_daemon_shard_workers()),
@@ -1096,6 +1115,7 @@ struct ShardSearchKey {
     query: String,
     limit: usize,
     filters: SearchFilters,
+    epoch: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1103,6 +1123,12 @@ struct ShardQueryPlanKey {
     index_dir: PathBuf,
     query: String,
     filters: SearchFilters,
+    epoch: u64,
+}
+
+struct CachedCompletedWork<T> {
+    value: T,
+    last_access: u64,
 }
 
 struct InFlightWork<T> {
@@ -1435,6 +1461,26 @@ impl ToolRuntime {
     pub fn coalesced_shard_query_plan_waiter_count(&self) -> u64 {
         self.coalesced_shard_query_plan_waiters
             .load(AtomicOrdering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn completed_shard_search_cache_hit_count(&self) -> u64 {
+        self.completed_shard_search_hits
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn completed_shard_query_plan_cache_hit_count(&self) -> u64 {
+        self.completed_shard_query_plan_hits
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn completed_shard_search_cache_entry_count(&self) -> usize {
+        self.completed_shard_searches
+            .lock()
+            .map(|searches| searches.len())
+            .unwrap_or(0)
     }
 
     pub fn max_cached_indexes(&self) -> usize {
@@ -7084,7 +7130,7 @@ impl ToolRuntime {
             results.is_empty(),
             primary_retry_request.as_ref(),
         )?;
-        let shard_route = shard_query_route_stats(&index_dir, query, &filters)?;
+        let shard_route = self.cached_shard_route_stats(&index_dir, query, &filters)?;
         let freshness = self.search_auto_shard_freshness(
             !refresh_if_stale && (diagnose || results.is_empty()),
             &index_dir,
@@ -7391,6 +7437,153 @@ impl ToolRuntime {
         self.next_index_access.fetch_add(1, AtomicOrdering::Relaxed)
     }
 
+    fn next_completed_shard_cache_access(&self) -> u64 {
+        self.next_completed_shard_cache_access
+            .fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    fn completed_shard_cache_epoch(&self) -> u64 {
+        self.completed_shard_cache_epoch
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    fn invalidate_completed_shard_work_caches(&self) -> Result<()> {
+        self.completed_shard_searches
+            .lock()
+            .map_err(|_| anyhow!("completed shard search cache lock poisoned"))?
+            .clear();
+        self.completed_shard_query_plans
+            .lock()
+            .map_err(|_| anyhow!("completed shard query-plan cache lock poisoned"))?
+            .clear();
+        self.completed_shard_route_stats
+            .lock()
+            .map_err(|_| anyhow!("completed shard route cache lock poisoned"))?
+            .clear();
+        self.completed_shard_cache_epoch
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
+    fn cached_completed_shard_search(
+        &self,
+        key: &ShardSearchKey,
+    ) -> Result<Option<Vec<SearchResult>>> {
+        let access = self.next_completed_shard_cache_access();
+        let mut searches = self
+            .completed_shard_searches
+            .lock()
+            .map_err(|_| anyhow!("completed shard search cache lock poisoned"))?;
+        if let Some(entry) = searches.get_mut(key) {
+            entry.last_access = access;
+            self.completed_shard_search_hits
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(Some(entry.value.clone()));
+        }
+        Ok(None)
+    }
+
+    fn store_completed_shard_search(
+        &self,
+        key: ShardSearchKey,
+        value: Vec<SearchResult>,
+    ) -> Result<()> {
+        let access = self.next_completed_shard_cache_access();
+        let mut searches = self
+            .completed_shard_searches
+            .lock()
+            .map_err(|_| anyhow!("completed shard search cache lock poisoned"))?;
+        searches.insert(
+            key,
+            CachedCompletedWork {
+                value,
+                last_access: access,
+            },
+        );
+        evict_oldest_completed_work(&mut searches, MAX_COMPLETED_SHARD_WORK_CACHE);
+        Ok(())
+    }
+
+    fn cached_completed_shard_query_plans(
+        &self,
+        key: &ShardQueryPlanKey,
+    ) -> Result<Option<Vec<ShardQueryPlan>>> {
+        let access = self.next_completed_shard_cache_access();
+        let mut plans = self
+            .completed_shard_query_plans
+            .lock()
+            .map_err(|_| anyhow!("completed shard query-plan cache lock poisoned"))?;
+        if let Some(entry) = plans.get_mut(key) {
+            entry.last_access = access;
+            self.completed_shard_query_plan_hits
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(Some(entry.value.clone()));
+        }
+        Ok(None)
+    }
+
+    fn store_completed_shard_query_plans(
+        &self,
+        key: ShardQueryPlanKey,
+        value: Vec<ShardQueryPlan>,
+    ) -> Result<()> {
+        let access = self.next_completed_shard_cache_access();
+        let mut plans = self
+            .completed_shard_query_plans
+            .lock()
+            .map_err(|_| anyhow!("completed shard query-plan cache lock poisoned"))?;
+        plans.insert(
+            key,
+            CachedCompletedWork {
+                value,
+                last_access: access,
+            },
+        );
+        evict_oldest_completed_work(&mut plans, MAX_COMPLETED_SHARD_WORK_CACHE);
+        Ok(())
+    }
+
+    fn cached_shard_route_stats(
+        &self,
+        index_dir: &Path,
+        query: &str,
+        filters: &SearchFilters,
+    ) -> Result<ShardRouteStats> {
+        let key = ShardQueryPlanKey {
+            index_dir: canonical_cache_key(index_dir),
+            query: query.to_string(),
+            filters: filters.clone(),
+            epoch: self.completed_shard_cache_epoch(),
+        };
+        let access = self.next_completed_shard_cache_access();
+        {
+            let mut routes = self
+                .completed_shard_route_stats
+                .lock()
+                .map_err(|_| anyhow!("completed shard route cache lock poisoned"))?;
+            if let Some(entry) = routes.get_mut(&key) {
+                entry.last_access = access;
+                return Ok(entry.value.clone());
+            }
+        }
+
+        let stats = shard_query_route_stats(index_dir, query, filters)?;
+        let access = self.next_completed_shard_cache_access();
+        let mut routes = self
+            .completed_shard_route_stats
+            .lock()
+            .map_err(|_| anyhow!("completed shard route cache lock poisoned"))?;
+        routes.insert(
+            key,
+            CachedCompletedWork {
+                value: stats.clone(),
+                last_access: access,
+            },
+        );
+        evict_oldest_completed_work(&mut routes, MAX_COMPLETED_SHARD_WORK_CACHE);
+        Ok(stats)
+    }
+
     fn replace_cached_index(&self, index_path: PathBuf, index: Arc<FastIndex>) -> Result<PathBuf> {
         let key = canonical_cache_key(&index_path);
         let fingerprint = index_file_fingerprint(&key);
@@ -7405,6 +7598,7 @@ impl ToolRuntime {
                 );
         }
         self.evict_cached_indexes_if_needed(&key)?;
+        self.invalidate_completed_shard_work_caches()?;
         Ok(key)
     }
 
@@ -7412,7 +7606,7 @@ impl ToolRuntime {
         let key = canonical_cache_key(&index_path);
         loop {
             let current_fingerprint = index_file_fingerprint(&key);
-            let (entry, should_load) = {
+            let (entry, should_load, stale_ready) = {
                 let mut indexes = self
                     .indexes
                     .lock()
@@ -7421,16 +7615,20 @@ impl ToolRuntime {
                     if entry.ready_is_stale(current_fingerprint) {
                         let entry = Arc::new(IndexCacheEntry::loading());
                         indexes.insert(key.clone(), Arc::clone(&entry));
-                        (entry, true)
+                        (entry, true, true)
                     } else {
-                        (Arc::clone(entry), false)
+                        (Arc::clone(entry), false, false)
                     }
                 } else {
                     let entry = Arc::new(IndexCacheEntry::loading());
                     indexes.insert(key.clone(), Arc::clone(&entry));
-                    (entry, true)
+                    (entry, true, false)
                 }
             };
+
+            if stale_ready {
+                self.invalidate_completed_shard_work_caches()?;
+            }
 
             if should_load {
                 let loaded = FastIndex::load(&key).map(Arc::new);
@@ -7717,6 +7915,7 @@ impl ToolRuntime {
             .lock()
             .map_err(|_| anyhow!("shard manifest cache lock poisoned"))?
             .clear();
+        self.invalidate_completed_shard_work_caches()?;
         Ok(())
     }
 
@@ -7726,6 +7925,7 @@ impl ToolRuntime {
             .lock()
             .map_err(|_| anyhow!("index cache lock poisoned"))?
             .retain(|path, _| !path.starts_with(&index_dir));
+        self.invalidate_completed_shard_work_caches()?;
         Ok(())
     }
 
@@ -7733,27 +7933,34 @@ impl ToolRuntime {
         let Some(max_ready_indexes) = self.cache_policy.max_ready_indexes else {
             return Ok(());
         };
-        let mut indexes = self
-            .indexes
-            .lock()
-            .map_err(|_| anyhow!("index cache lock poisoned"))?;
-        loop {
-            let ready_count = indexes.values().filter(|entry| entry.is_ready()).count();
-            if ready_count <= max_ready_indexes {
-                break;
+        let mut evicted = false;
+        {
+            let mut indexes = self
+                .indexes
+                .lock()
+                .map_err(|_| anyhow!("index cache lock poisoned"))?;
+            loop {
+                let ready_count = indexes.values().filter(|entry| entry.is_ready()).count();
+                if ready_count <= max_ready_indexes {
+                    break;
+                }
+                let victim = indexes
+                    .iter()
+                    .filter(|(path, entry)| path.as_path() != protected && entry.is_ready())
+                    .filter_map(|(path, entry)| {
+                        entry.last_access().map(|access| (path.clone(), access))
+                    })
+                    .min_by_key(|(_, access)| *access)
+                    .map(|(path, _)| path);
+                let Some(victim) = victim else {
+                    break;
+                };
+                indexes.remove(&victim);
+                evicted = true;
             }
-            let victim = indexes
-                .iter()
-                .filter(|(path, entry)| path.as_path() != protected && entry.is_ready())
-                .filter_map(|(path, entry)| {
-                    entry.last_access().map(|access| (path.clone(), access))
-                })
-                .min_by_key(|(_, access)| *access)
-                .map(|(path, _)| path);
-            let Some(victim) = victim else {
-                break;
-            };
-            indexes.remove(&victim);
+        }
+        if evicted {
+            self.invalidate_completed_shard_work_caches()?;
         }
         Ok(())
     }
@@ -7803,11 +8010,15 @@ impl ToolRuntime {
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>> {
         let key = ShardSearchKey {
-            index_dir: index_dir.to_path_buf(),
+            index_dir: canonical_cache_key(index_dir),
             query: shard_query.to_string(),
             limit,
             filters: filters.clone(),
+            epoch: self.completed_shard_cache_epoch(),
         };
+        if let Some(results) = self.cached_completed_shard_search(&key)? {
+            return Ok(results);
+        }
         let (entry, leader) = {
             let mut searches = self
                 .inflight_shard_searches
@@ -7834,6 +8045,9 @@ impl ToolRuntime {
             Err(error) => Err(error.to_string()),
         };
         let finish_result = entry.finish(shared_result);
+        if let Ok(results) = &result {
+            self.store_completed_shard_search(key.clone(), results.clone())?;
+        }
         if let Ok(mut searches) = self.inflight_shard_searches.lock() {
             if searches
                 .get(&key)
@@ -7973,10 +8187,14 @@ impl ToolRuntime {
         filters: &SearchFilters,
     ) -> Result<Vec<ShardQueryPlan>> {
         let key = ShardQueryPlanKey {
-            index_dir: index_dir.to_path_buf(),
+            index_dir: canonical_cache_key(index_dir),
             query: shard_query.to_string(),
             filters: filters.clone(),
+            epoch: self.completed_shard_cache_epoch(),
         };
+        if let Some(plans) = self.cached_completed_shard_query_plans(&key)? {
+            return Ok(plans);
+        }
         let (entry, leader) = {
             let mut plans = self
                 .inflight_shard_query_plans
@@ -8003,6 +8221,9 @@ impl ToolRuntime {
             Err(error) => Err(error.to_string()),
         };
         let finish_result = entry.finish(shared_result);
+        if let Ok(plans) = &result {
+            self.store_completed_shard_query_plans(key.clone(), plans.clone())?;
+        }
         if let Ok(mut plans) = self.inflight_shard_query_plans.lock() {
             if plans
                 .get(&key)
@@ -8584,6 +8805,22 @@ fn canonical_cache_key(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+fn evict_oldest_completed_work<K: Clone + Eq + Hash, T>(
+    cache: &mut HashMap<K, CachedCompletedWork<T>>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&victim);
+    }
 }
 
 fn index_file_fingerprint(index_path: &Path) -> Option<CacheFileFingerprint> {
