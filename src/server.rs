@@ -1052,6 +1052,7 @@ pub struct ToolRuntime {
     inflight_shard_searches: Mutex<HashMap<ShardSearchKey, Arc<InFlightWork<Vec<SearchResult>>>>>,
     inflight_shard_query_plans:
         Mutex<HashMap<ShardQueryPlanKey, Arc<InFlightWork<Vec<ShardQueryPlan>>>>>,
+    inflight_shard_freshness: Mutex<HashMap<ShardFreshnessKey, Arc<InFlightWork<ShardFreshness>>>>,
     completed_shard_searches:
         Mutex<HashMap<ShardSearchKey, CachedCompletedWork<Vec<SearchResult>>>>,
     completed_shard_query_plans:
@@ -1084,6 +1085,7 @@ impl Default for ToolRuntime {
             shard_manifests: Mutex::new(HashMap::new()),
             inflight_shard_searches: Mutex::new(HashMap::new()),
             inflight_shard_query_plans: Mutex::new(HashMap::new()),
+            inflight_shard_freshness: Mutex::new(HashMap::new()),
             completed_shard_searches: Mutex::new(HashMap::new()),
             completed_shard_query_plans: Mutex::new(HashMap::new()),
             completed_shard_route_stats: Mutex::new(HashMap::new()),
@@ -1458,6 +1460,21 @@ impl ToolRuntime {
         Ok(warmed)
     }
 
+    pub fn warm_shard_queries(
+        &self,
+        index_dir: PathBuf,
+        queries: &[String],
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> Result<usize> {
+        let mut warmed = 0usize;
+        for query in queries {
+            let _ = self.search_shards_cached(&index_dir, query, limit, filters, 0)?;
+            warmed += 1;
+        }
+        Ok(warmed)
+    }
+
     pub fn register_shards(&self, index_dir: PathBuf) -> Result<usize> {
         let manifest = self.cached_shard_manifest(&index_dir)?;
         Ok(manifest.shards.len())
@@ -1555,6 +1572,9 @@ impl ToolRuntime {
             "max_cached_indexes": self.max_cached_indexes(),
             "cached_indexes": self.cached_index_count(),
             "cached_shard_manifests": self.cached_shard_manifest_count(),
+            "completed_shard_search_cache_entries": self.completed_shard_search_cache_entry_count(),
+            "completed_shard_search_cache_hits": self.completed_shard_search_cache_hit_count(),
+            "completed_shard_query_plan_cache_hits": self.completed_shard_query_plan_cache_hit_count(),
             "footprint": footprint,
             "details_omitted": !include_details
         });
@@ -7700,23 +7720,57 @@ impl ToolRuntime {
             }
         }
 
-        let status = shard_status_by_root(index_dir, &key.roots)?;
-        let stored_at = Instant::now();
-        let access = self.next_completed_shard_cache_access();
-        let mut entries = self
-            .completed_shard_freshness
-            .lock()
-            .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?;
-        entries.insert(
-            key,
-            CachedTimedCompletedWork {
-                value: status.clone(),
-                last_access: access,
-                stored_at,
-            },
-        );
-        evict_oldest_timed_completed_work(&mut entries, MAX_COMPLETED_SHARD_WORK_CACHE);
-        Ok(status)
+        let (entry, leader) = {
+            let mut freshness = self
+                .inflight_shard_freshness
+                .lock()
+                .map_err(|_| anyhow!("in-flight shard freshness map lock poisoned"))?;
+            if let Some(entry) = freshness.get(&key) {
+                (Arc::clone(entry), false)
+            } else {
+                let entry = Arc::new(InFlightWork::running());
+                freshness.insert(key.clone(), Arc::clone(&entry));
+                (entry, true)
+            }
+        };
+
+        if !leader {
+            return entry.wait();
+        }
+
+        let result = shard_status_by_root(index_dir, &key.roots);
+        let shared_result = match &result {
+            Ok(status) => Ok(status.clone()),
+            Err(error) => Err(error.to_string()),
+        };
+        let finish_result = entry.finish(shared_result);
+        if let Ok(status) = &result {
+            let stored_at = Instant::now();
+            let access = self.next_completed_shard_cache_access();
+            let mut entries = self
+                .completed_shard_freshness
+                .lock()
+                .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?;
+            entries.insert(
+                key.clone(),
+                CachedTimedCompletedWork {
+                    value: status.clone(),
+                    last_access: access,
+                    stored_at,
+                },
+            );
+            evict_oldest_timed_completed_work(&mut entries, MAX_COMPLETED_SHARD_WORK_CACHE);
+        }
+        if let Ok(mut freshness) = self.inflight_shard_freshness.lock() {
+            if freshness
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                freshness.remove(&key);
+            }
+        }
+        finish_result?;
+        result
     }
 
     fn replace_cached_index(&self, index_path: PathBuf, index: Arc<FastIndex>) -> Result<PathBuf> {

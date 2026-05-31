@@ -1204,6 +1204,13 @@ enum Commands {
             help = "Warm only shard indexes whose repo root matches this path"
         )]
         warm_repos: Vec<PathBuf>,
+        #[arg(
+            long = "warm-query",
+            help = "Precompute shard search results for this query at daemon startup"
+        )]
+        warm_queries: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        warm_query_limit: usize,
         #[arg(long)]
         max_cached_indexes: Option<usize>,
         #[arg(long = "ensure-shards-dir")]
@@ -1236,6 +1243,13 @@ enum Commands {
             help = "Warm only shard indexes whose repo root matches this path"
         )]
         warm_repos: Vec<PathBuf>,
+        #[arg(
+            long = "warm-query",
+            help = "Precompute shard search results for this query at daemon startup"
+        )]
+        warm_queries: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        warm_query_limit: usize,
         #[arg(long)]
         max_cached_indexes: Option<usize>,
         #[arg(long = "ensure-shards-dir")]
@@ -6255,6 +6269,8 @@ fn run() -> Result<()> {
             index_dirs,
             warm_index_dirs,
             warm_repos,
+            warm_queries,
+            warm_query_limit,
             max_cached_indexes,
             ensure_shard_dirs,
             repos,
@@ -6265,11 +6281,13 @@ fn run() -> Result<()> {
             nested_manifests,
         } => {
             let listener = TcpListener::bind(&addr)?;
-            let (runtime, ensured_shards) = bootstrap_runtime(
+            let (runtime, ensured_shards, warmed_queries) = bootstrap_runtime(
                 indexes,
                 index_dirs,
                 warm_index_dirs,
                 warm_repos,
+                warm_queries,
+                warm_query_limit,
                 max_cached_indexes,
                 ensure_shard_dirs,
                 repos,
@@ -6286,6 +6304,7 @@ fn run() -> Result<()> {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "max_cached_indexes": runtime.max_cached_indexes(),
                 "cached_indexes": runtime.cached_index_count(),
+                "warmed_queries": warmed_queries,
                 "ensured_shards": ensured_shards,
                 "daemon_status": runtime.daemon_status_for_arguments(&serde_json::json!({}))
             });
@@ -6301,6 +6320,8 @@ fn run() -> Result<()> {
             index_dirs,
             warm_index_dirs,
             warm_repos,
+            warm_queries,
+            warm_query_limit,
             max_cached_indexes,
             ensure_shard_dirs,
             repos,
@@ -6315,11 +6336,13 @@ fn run() -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
             let listener = UnixListener::bind(&socket)?;
-            let (runtime, ensured_shards) = bootstrap_runtime(
+            let (runtime, ensured_shards, warmed_queries) = bootstrap_runtime(
                 indexes,
                 index_dirs,
                 warm_index_dirs,
                 warm_repos,
+                warm_queries,
+                warm_query_limit,
                 max_cached_indexes,
                 ensure_shard_dirs,
                 repos,
@@ -6335,6 +6358,7 @@ fn run() -> Result<()> {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "max_cached_indexes": runtime.max_cached_indexes(),
                 "cached_indexes": runtime.cached_index_count(),
+                "warmed_queries": warmed_queries,
                 "ensured_shards": ensured_shards,
                 "daemon_status": runtime.daemon_status_for_arguments(&serde_json::json!({}))
             });
@@ -6360,6 +6384,8 @@ fn bootstrap_runtime(
     index_dirs: Vec<PathBuf>,
     warm_index_dirs: Vec<PathBuf>,
     warm_repos: Vec<PathBuf>,
+    warm_queries: Vec<String>,
+    warm_query_limit: usize,
     max_cached_indexes: Option<usize>,
     ensure_shard_dirs: Vec<PathBuf>,
     repos: Vec<PathBuf>,
@@ -6368,7 +6394,7 @@ fn bootstrap_runtime(
     discover_limit: usize,
     family_limit: Option<usize>,
     nested_manifests: bool,
-) -> Result<(ToolRuntime, Vec<Value>)> {
+) -> Result<(ToolRuntime, Vec<Value>, usize)> {
     let runtime = ToolRuntime::with_max_cached_indexes(daemon_cache_limit(
         max_cached_indexes,
         &warm_index_dirs,
@@ -6403,13 +6429,57 @@ fn bootstrap_runtime(
         }
     }
     let mut warmed_repo_shards = 0usize;
-    for index_dir in registered_shard_dirs {
-        warmed_repo_shards += runtime.warm_shard_roots(index_dir, &warm_repos)?;
+    for index_dir in &registered_shard_dirs {
+        warmed_repo_shards += runtime.warm_shard_roots(index_dir.clone(), &warm_repos)?;
     }
     if !warm_repos.is_empty() && warmed_repo_shards == 0 {
         bail!("--warm-repo did not match any registered shard repo roots");
     }
-    Ok((runtime, ensured_shards))
+    let warmed_queries = warm_startup_queries(
+        &runtime,
+        &registered_shard_dirs,
+        &warm_repos,
+        &warm_queries,
+        warm_query_limit,
+    )?;
+    Ok((runtime, ensured_shards, warmed_queries))
+}
+
+fn warm_startup_queries(
+    runtime: &ToolRuntime,
+    index_dirs: &[PathBuf],
+    warm_repos: &[PathBuf],
+    warm_queries: &[String],
+    limit: usize,
+) -> Result<usize> {
+    if warm_queries.is_empty() {
+        return Ok(0);
+    }
+    if index_dirs.is_empty() {
+        bail!("--warm-query requires at least one registered shard directory");
+    }
+    let limit = limit.max(1);
+    let mut warmed = 0usize;
+    for index_dir in index_dirs {
+        if warm_repos.is_empty() {
+            warmed += runtime.warm_shard_queries(
+                index_dir.clone(),
+                warm_queries,
+                limit,
+                &SearchFilters::default(),
+            )?;
+        } else {
+            for repo in warm_repos {
+                let filters = SearchFilters {
+                    repo: Some(repo.to_string_lossy().to_string()),
+                    ..SearchFilters::default()
+                };
+                warmed +=
+                    runtime.warm_shard_queries(index_dir.clone(), warm_queries, limit, &filters)?;
+            }
+        }
+    }
+    Ok(warmed)
 }
 
 fn daemon_cache_limit(
