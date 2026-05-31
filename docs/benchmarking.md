@@ -277,9 +277,9 @@ unscoped queries over very large multi-checkout workspaces are expected to expos
 routing and fanout limits; those numbers are planning inputs, not CI gates.
 For shard benchmarks, inspect each query's `shard_route` field. `selected_shards`
 near `total_shards` means the query is paying broad fanout cost before ranking.
-`tools/ci/orient_wide_perf.sh` is the compact workspace gate for the documented
-`/Documents/Projects` target. It gates fallback and cached-shard p95/p99 by
-default; tune those thresholds with `ORIENT_WIDE_FALLBACK_P95_MS`,
+`tools/ci/orient_wide_perf.sh` is the compact workspace gate for a local
+multi-repo workspace. It gates fallback and cached-shard p95/p99 by default;
+tune those thresholds with `ORIENT_WIDE_FALLBACK_P95_MS`,
 `ORIENT_WIDE_FALLBACK_P99_MS`, `ORIENT_WIDE_SHARD_P95_MS`, and
 `ORIENT_WIDE_SHARD_P99_MS`.
 

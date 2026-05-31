@@ -1,13 +1,12 @@
 # Orient Search
 
-Orient Search is a local code-search daemon for coding agents. It provides repo
-maps, indexed search, query plans, and bounded file reads so agents can inspect
-code quickly without repeated filesystem scans. It stores local code-search
-artifacts only and has no telemetry.
+Fast local code search for coding agents.
 
-## Shared Daemon
+Orient gives local agents repo maps, indexed search, query plans, and bounded
+file reads so they stop repeating expensive filesystem scans. It stores local
+code-search artifacts only and has no telemetry.
 
-Run one shared daemon for the repos local agents are likely to touch:
+## Start A Shared Daemon
 
 ```bash
 cargo install --git https://github.com/evalops/orient-search
@@ -15,7 +14,6 @@ orient --version
 
 export ORIENT_WORKSPACES=/path/to/workspaces
 export ORIENT_SHARDS=/path/to/local/cache/orient-shards
-export ORIENT_INDEX=/path/to/local/cache/orient.index
 
 orient ensure-shards \
   --discover-root "$ORIENT_WORKSPACES" \
@@ -24,44 +22,26 @@ orient ensure-shards \
 
 orient serve-tcp \
   --addr 127.0.0.1:8796 \
-  --index-dir "$ORIENT_SHARDS"
+  --index-dir "$ORIENT_SHARDS" \
+  --warm-repo /path/to/current/repo \
+  --warm-query "file:README.md"
 ```
 
-`--index-dir` registers the shard manifest and lazily loads individual repo
-indexes on first use. Add `--warm-repo /path/to/current/repo` for the one or two
-active checkouts that should avoid first-touch latency without loading every
-shard; warm repo indexes are pinned so ordinary lazy loads do not evict them, and
-`--max-cached-indexes` applies to the evictable pool. Add
-`--warm-query "file:README.md"` for startup query-result prewarming;
-with `--warm-repo`, those query caches are repo-scoped. The daemon keeps at most
-64 lazy indexes by default; when using `--warm-index-dir`, it sizes the default
-cache to the warmed shard count. Set
-`--max-cached-indexes N`, `ORIENT_MAX_SHARD_WORKERS=N`, and
-`ORIENT_MAX_DAEMON_SHARD_WORKERS=N` to tune shared multi-agent runs. Use
+`--index-dir` registers a shard manifest and loads repo indexes lazily. Use
+`--warm-repo` for the one or two active checkouts agents are editing, and
+`--max-cached-indexes N` when many repos share the daemon. Use
 `--warm-index-dir "$ORIENT_SHARDS"` only when you intentionally want to load all
-shard indexes at startup.
+shards at startup.
 
-Then verify the daemon and generate the short instruction snippet:
+Check the daemon and generate the agent-facing setup text:
 
 ```bash
 orient doctor --index-dir "$ORIENT_SHARDS"
-orient agent-instructions --profile generic --index-dir "$ORIENT_SHARDS"
 orient daemon-status
-orient daemon-status --format json
+orient agent-instructions --profile generic --index-dir "$ORIENT_SHARDS"
 ```
 
-When using a Unix socket daemon, pass `--socket "$ORIENT_SOCKET"` or export
-`ORIENT_SOCKET` before generating instructions.
-
-`daemon-status` reports the daemon version, process id, uptime, shard worker cap,
-registered shard directories, and warmed indexes. If the version is missing or
-differs from `orient --version`, restart the shared daemon. The JSON-lines
-`daemon_status` tool is compact by default; pass `details:true` only when you
-need cached paths and per-target details.
-
-The daemon shares local search artifacts only: indexes, shard manifests, repo
-maps, and cached file metadata. It is not a remote service or a general runtime
-state layer.
+Unix sockets are supported with `orient serve-unix --socket "$ORIENT_SOCKET"`.
 
 ## Search
 
@@ -69,135 +49,68 @@ state layer.
 orient search-auto --retry-if-empty --summary "symbol:SessionManager token"
 orient search-auto --no-daemon "symbol:SessionManager token"
 orient search --repo . "issue token"
-orient search --index "$ORIENT_INDEX" "issue token"
 orient search --index-dir "$ORIENT_SHARDS" "repo:service issue token"
-orient read-range --index "$ORIENT_INDEX" src/lib.rs:40:80
-orient read-range --repo . src/lib.rs#L40C9-L45C1
+orient read-range --repo . src/lib.rs:40:80
 ```
 
-With no explicit `--repo`, `--index`, or `--index-dir`, `search-auto` first
-uses the shared daemon at `127.0.0.1:8796` when available, then falls back to a
-live search of the current directory. When run from inside a git checkout, the
-daemon request is scoped to that checkout so multi-repo shard daemons stay
-focused on the agent's current task and only load matching shard indexes. Use
-`--daemon-addr` or `ORIENT_ADDR` for another TCP daemon, `ORIENT_SOCKET` for a
-Unix socket daemon, or `--no-daemon` to force local fallback.
+With no explicit target, `search-auto` tries the shared daemon at
+`127.0.0.1:8796`, scopes daemon requests to the current checkout when possible,
+then falls back to live local search. Set `ORIENT_ADDR`, `ORIENT_SOCKET`, or
+`--no-daemon` to choose a different path.
 
-`orient client-jsonl` adds the shell's current working directory to no-target
-search, map, plan, symbol, read, and related-file calls. Generated client
-commands pass `--require-version` so stale shared daemons fail loudly instead of
-serving an older protocol shape. Other protocol clients can pass `cwd`
-explicitly. The daemon uses that checkout as the default scope, which keeps
-shared multi-repo daemons focused on the current task. With the same scope,
-`refresh_if_stale:true` refreshes only that repo's shard. Empty or diagnostic
-`search_auto` responses include a compact `freshness` object when the scoped
-index is stale, plus a top-level ready-to-run `refresh_request` that refreshes
-and repeats the search. With `retry_if_empty:true`, Orient runs that refresh
-request once and returns the refreshed response as `primary_retry_result`.
-Shard freshness includes branch/origin metadata drift, so switching branches
-without touching files is still detected.
-`client-jsonl` and `daemon-status` also honor `ORIENT_SOCKET` and `ORIENT_ADDR`
-when no transport flag is passed, with explicit flags taking precedence.
-When a JSON-lines or MCP client calls `daemon_status` with `cwd`, the returned
-`default_requests` also include that `cwd`, so copyable first map, search,
-batch, and query-plan calls stay scoped to the active checkout. Those scoped
-defaults also set `refresh_if_stale:true`, so they refresh only that checkout's
-shard before use.
+Useful filters include `repo:`, `path:`/`dir:`, `file:`, `lang:`, `ext:`,
+`symbol:`, `kind:`, `test:`, `generated:`, `code:`, `content:`, quoted phrases,
+negative filters such as `-path:vendor`, and `mode:any` for broad orientation.
+Pasted file locations, stack frames, test selectors, package scripts, Makefile
+targets, Justfile targets, and Bazel labels resolve to anchored searches.
 
-Useful filters include `repo:`, `path:`/`dir:`/`in:`/`under:`, `file:`, `lang:`, `ext:`,
-`symbol:`, `kind:`/`type:`, `line:`, `test:`, `generated:`, `code:`,
-`content:`, quoted phrases, negative filters like `-path:vendor`, and `mode:any`
-for broad orientation. Bare filenames, pasted file locations, in-repo absolute
-paths, Python tracebacks, JavaScript stack frames, Markdown links, and hosted
-code links resolve to anchored file searches. Go panic stack locations are
-accepted too. Pytest node IDs and simple pytest commands such as
-`pytest tests/test_auth.py::test_login -q` resolve to the test file. Simple
-Cargo test commands such as `cargo test parser_accepts_locations` resolve to
-the Rust test function; integration-test commands such as
-`cargo test --test parser_rs parser_accepts_locations` resolve to the integration
-test file and function. `go test ./pkg/auth -run TestLoginFlow` resolves to
-the Go test function within that package. Maven and Gradle selectors such as
-`mvn test -Dtest=GatewayTest#routesPayment` and
-`./gradlew test --tests com.example.GatewayTest.routesPayment` resolve to the
-matching JVM test method. Package script commands such as `npm run typecheck`,
-`yarn run build:prod`, and shortcut forms like `pnpm lint` resolve to
-package.json scripts. Task commands such as `make deploy` and
-`just release target=prod` resolve to Makefile and Justfile targets.
-Language filters include common shorthands such as
-`lang:rs`, `lang:ts`, `lang:cpp`, `lang:csharp`, `lang:shell`,
-`lang:makefile`, and `lang:justfile`. `kind:target` and `recipe:name` can jump
-to Makefile targets,
-Justfile targets, GitHub Actions jobs, and Bazel BUILD rule names. Pasted Bazel
-labels like `//tools/search:orient_cli` and `:agent_smoke_test` infer target
-symbol searches too, including inside commands like
-`bazel test //tools/search:orient_cli`. `kind:script` and `script:name` can jump
-to package.json and pyproject scripts; `package:name` can jump to
-package.json packages, Cargo packages, pyproject packages, Go module paths,
-Maven coordinates, and Gradle project names; `bin:name`, `example:name`, and
-`bench:name` can jump to Cargo manifest entries; `service:name` can jump to
-Docker Compose services; `stage:name` can jump to Dockerfile build stages. See
-[Agent protocol](docs/agent-protocol.md) for the full query language.
+## Agent Protocol
 
-## Protocol
-
-JSON-lines requests look like this:
+Orient exposes JSON-lines, TCP, Unix socket, and MCP-shaped surfaces. Search
+results include ready-to-run read, related-file, related-symbol, repo-map, and
+query-plan follow-ups. Agents should run those returned requests directly
+instead of translating them back into shell search/read commands.
 
 ```jsonl
 {"id":"tools","tool":"tool_manifest","arguments":{}}
-{"id":"guide","tool":"agent_guide","arguments":{"index_dir":"/path/to/local/cache/orient-shards"}}
-{"id":"map","tool":"shard_repo_map","arguments":{"index_dir":"/path/to/local/cache/orient-shards","detail":"compact","read_limit":16}}
-{"id":"search","tool":"search_auto","arguments":{"query":"repo:service branch:main symbol:SessionManager token","limit":10,"explain":true,"summary":true}}
-{"id":"read","tool":"open_ranges","arguments":{"index_dir":"/path/to/local/cache/orient-shards","ranges":[{"path":"service/src/auth.rs","start":40,"lines":80},"service/src/lib.rs#L40-L45"]}}
+{"id":"search","tool":"search_auto","arguments":{"query":"repo:service symbol:SessionManager token","limit":10,"summary":true}}
+{"id":"read","tool":"open_ranges","arguments":{"ranges":["service/src/auth.rs:40:80"]}}
 ```
 
-Search results include ready-to-send read, related-file, related-symbol,
-repo-map, and query-plan follow-ups with `jsonl`, `client_cli`, and compact CLI
-hints. Agents should run those returned requests directly instead of translating
-them back into shell search/read commands.
+Compact fields are the default place to look first:
 
-Symbol lookups include per-hit `read_request`; add `include_read_batch:true` or
-use `find_symbol_batch` when the next step is opening all matching definitions.
+- `query_plan_summary`, `summary`, and `next_action` explain what to do next.
+- `read_request` and `next_read_batch_request` open bounded context.
+- `refresh_request` refreshes stale scoped shards without rebuilding everything.
+- `advice:true` or `--advice` returns short query-plan retry guidance.
 
-`search_auto`, `search_auto_batch`, and plan batch items expose
-`query_plan_summary` or `summary` alongside optional full plans, plus `next_action` when
-Orient can choose the best immediate follow-up. Search summaries also surface
-grouped duplicate counts when repeated worktree or copied files collapse into a
-canonical result. Shard-backed search summaries include `shard_route` with the
-route status and selected shard count, plus `fanout_warning` when a broad query
-selects many shards. Use those compact fields first; open the full plan only
-when a wrapper needs detailed diagnostics. For direct diagnostics, pass JSON-lines
-`summary:true` or add `--summary` to `search-auto`, `search-auto-batch`,
-`search-plan`, `search-plan-batch`, `index-plan`, or `index-plan-batch`.
-When an adapter only needs the next move, plan tools also accept `advice:true`
-or `--advice`; that returns status, the suggested query, top hint kinds, and
-ready retry CLI/JSONL strings without full plan payloads.
-
-Shard searches overfetch enough candidates for final ranking, then stop
-remaining shard work once the result budget is satisfied. This keeps broad
-multi-repo searches bounded without changing the top-level `limit` contract.
-
-Batch read follow-ups include `read_budget` so wrappers can split large reads
-before hitting range or line caps. Manual reads accept copied file locations such
-as `src/lib.rs:42-45` and can use `scope:symbol` to anchor at the nearest
-definition; the read summary reports when a range hit the hard line cap.
+See [Agent protocol](docs/agent-protocol.md) for the full tool surface.
 
 ## Footprint
 
-Orient stores source snapshots and line offsets in persisted indexes so bounded
-reads stay fast even when served by a shared daemon. Keep indexes in a local
-cache and out of source control. Indexes contain source text and search metadata,
-with no telemetry.
-
-Use:
+Indexes contain source snapshots, line offsets, postings, symbols, and search
+metadata so snippets and bounded reads stay fast from a shared daemon. Keep them
+in a local cache and out of source control.
 
 ```bash
 orient shard-status --index-dir "$ORIENT_SHARDS" --summary
 ```
 
-The summary reports index size, represented source size, snapshot bytes,
-line-offset bytes, posting counts, compressed posting bytes, and largest shards.
-Indexes are usually larger than source because they keep enough local state for
-fast snippets and reads.
+## Benchmarks
+
+For local performance work, start with the 10-client shared-daemon contention
+benchmark:
+
+```bash
+ORIENT_DAEMON_CONTEND_ROOT=/path/to/workspaces \
+ORIENT_DAEMON_CONTEND_CWDS=/path/to/repo-a:/path/to/repo-b \
+ORIENT_DAEMON_CONTEND_MODE=both \
+tools/ci/orient_daemon_contention_perf.sh
+```
+
+Use [Benchmarking](docs/benchmarking.md) for the full benchmark matrix, including
+single-repo fallback vs indexed search, wide workspace gates, cold first-touch
+latency, warm daemon contention, and mixed search/read load.
 
 ## Build And Test
 
@@ -208,13 +121,11 @@ bazel run //:ci_full_test
 bazel run //:ci_perf_gates
 ```
 
-For local performance work, start with [Benchmarking](docs/benchmarking.md).
-
 ## Docs
 
 - [Shared daemon guide](docs/shared-daemon.md)
-- [Storage and footprint](docs/storage-footprint.md)
-- [Benchmarking](docs/benchmarking.md)
 - [Agent adoption](docs/agent-adoption.md)
 - [Agent protocol](docs/agent-protocol.md)
+- [Benchmarking](docs/benchmarking.md)
+- [Storage and footprint](docs/storage-footprint.md)
 - [Fast search roadmap](docs/fast-search-roadmap.md)
