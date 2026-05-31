@@ -11626,6 +11626,8 @@ fn tcp_daemon_bench_reports_concurrent_search_latency() {
             "2",
             "--warmup",
             "1",
+            "--request-timeout-ms",
+            "5000",
             "--query",
             "issue token",
         ])
@@ -13176,6 +13178,58 @@ fn tcp_daemon_honors_max_cached_indexes_for_lazy_shards() {
                 .to_string_lossy()
         )
     );
+}
+
+#[test]
+fn tcp_daemon_auto_sizes_default_cache_for_warmed_shards() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo_count = DEFAULT_MAX_CACHED_INDEXES + 1;
+    let mut repos = Vec::with_capacity(repo_count);
+    for index in 0..repo_count {
+        let repo = workspace.path().join(format!("repo-{index:03}"));
+        write(
+            &repo.join("src/lib.rs"),
+            &format!("pub fn unique_symbol_{index:03}() -> usize {{ {index} }}\n"),
+        );
+        repos.push(repo);
+    }
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+
+    let binary = assert_cmd::cargo::cargo_bin("orient");
+    let mut child = Command::new(binary)
+        .args([
+            "serve-tcp",
+            "--addr",
+            "127.0.0.1:0",
+            "--warm-index-dir",
+            shard_dir.path().to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut startup_reader = BufReader::new(stdout);
+    let mut startup = String::new();
+    startup_reader.read_line(&mut startup).unwrap();
+    let startup_json: serde_json::Value = serde_json::from_str(&startup).unwrap();
+
+    assert_eq!(
+        startup_json["max_cached_indexes"],
+        serde_json::json!(repo_count)
+    );
+    assert_eq!(
+        startup_json["cached_indexes"],
+        serde_json::json!(repo_count)
+    );
+    assert_eq!(
+        startup_json["daemon_status"]["cached_indexes"],
+        serde_json::json!(repo_count)
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

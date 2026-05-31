@@ -46,10 +46,11 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8796";
 const DEFAULT_CLI_READ_RANGE_LINES: usize = 80;
+const DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const ORIENT_ADDR_ENV: &str = "ORIENT_ADDR";
 #[cfg(unix)]
 const ORIENT_SOCKET_ENV: &str = "ORIENT_SOCKET";
@@ -946,6 +947,8 @@ enum Commands {
         warmup: usize,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        #[arg(long, default_value_t = DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS)]
+        request_timeout_ms: u64,
         #[arg(long = "repo-filter")]
         repo_filter: Option<String>,
         #[command(flatten)]
@@ -1048,8 +1051,8 @@ enum Commands {
         index_dirs: Vec<PathBuf>,
         #[arg(long = "warm-index-dir")]
         warm_index_dirs: Vec<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_MAX_CACHED_INDEXES)]
-        max_cached_indexes: usize,
+        #[arg(long)]
+        max_cached_indexes: Option<usize>,
         #[arg(long = "ensure-shards-dir")]
         ensure_shard_dirs: Vec<PathBuf>,
         #[arg(long = "repo")]
@@ -1075,8 +1078,8 @@ enum Commands {
         index_dirs: Vec<PathBuf>,
         #[arg(long = "warm-index-dir")]
         warm_index_dirs: Vec<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_MAX_CACHED_INDEXES)]
-        max_cached_indexes: usize,
+        #[arg(long)]
+        max_cached_indexes: Option<usize>,
         #[arg(long = "ensure-shards-dir")]
         ensure_shard_dirs: Vec<PathBuf>,
         #[arg(long = "repo")]
@@ -5722,6 +5725,7 @@ fn run() -> Result<()> {
             runs,
             warmup,
             limit,
+            request_timeout_ms,
             repo_filter,
             filters,
             fail_p95_ms,
@@ -5740,6 +5744,7 @@ fn run() -> Result<()> {
                 runs,
                 warmup,
                 limit,
+                request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
                 filters,
                 queries,
             })?;
@@ -5961,7 +5966,7 @@ fn bootstrap_runtime(
     indexes: Vec<PathBuf>,
     index_dirs: Vec<PathBuf>,
     warm_index_dirs: Vec<PathBuf>,
-    max_cached_indexes: usize,
+    max_cached_indexes: Option<usize>,
     ensure_shard_dirs: Vec<PathBuf>,
     repos: Vec<PathBuf>,
     discover_roots: Vec<PathBuf>,
@@ -5970,7 +5975,10 @@ fn bootstrap_runtime(
     family_limit: Option<usize>,
     nested_manifests: bool,
 ) -> Result<(ToolRuntime, Vec<Value>)> {
-    let runtime = ToolRuntime::with_max_cached_indexes(max_cached_indexes);
+    let runtime = ToolRuntime::with_max_cached_indexes(daemon_cache_limit(
+        max_cached_indexes,
+        &warm_index_dirs,
+    )?);
     for index in indexes {
         runtime.warm_index(index)?;
     }
@@ -5997,6 +6005,33 @@ fn bootstrap_runtime(
         }
     }
     Ok((runtime, ensured_shards))
+}
+
+fn daemon_cache_limit(
+    max_cached_indexes: Option<usize>,
+    warm_index_dirs: &[PathBuf],
+) -> Result<usize> {
+    if let Some(max_cached_indexes) = max_cached_indexes {
+        return Ok(max_cached_indexes.max(1));
+    }
+    let warmed_shards = warm_index_dirs
+        .iter()
+        .try_fold(0usize, |total, index_dir| {
+            Ok::<usize, anyhow::Error>(total + warmed_shard_count(index_dir)?)
+        })?;
+    Ok(DEFAULT_MAX_CACHED_INDEXES.max(warmed_shards).max(1))
+}
+
+fn warmed_shard_count(index_dir: &Path) -> Result<usize> {
+    let manifest_path = index_dir.join("manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let Some(shards) = manifest.get("shards").and_then(Value::as_array) else {
+        bail!(
+            "shard manifest {} is missing a shards array",
+            manifest_path.display()
+        );
+    };
+    Ok(shards.len())
 }
 
 fn non_empty_env_var(name: &str) -> Option<String> {
@@ -7497,6 +7532,7 @@ struct DaemonBenchConfig {
     runs: usize,
     warmup: usize,
     limit: usize,
+    request_timeout: Duration,
     filters: SearchFilters,
     queries: Vec<String>,
 }
@@ -7632,6 +7668,7 @@ fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
                 config.limit,
                 &config.filters,
                 concurrency,
+                config.request_timeout,
             )?;
         }
 
@@ -7645,6 +7682,7 @@ fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
                 config.limit,
                 &config.filters,
                 concurrency,
+                config.request_timeout,
             )?;
             for sample in wave {
                 samples_ms.push(sample.elapsed_ms);
@@ -7695,6 +7733,7 @@ fn run_daemon_search_wave(
     limit: usize,
     filters: &SearchFilters,
     concurrency: usize,
+    request_timeout: Duration,
 ) -> Result<Vec<DaemonBenchSample>> {
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut handles = Vec::with_capacity(concurrency);
@@ -7707,7 +7746,14 @@ fn run_daemon_search_wave(
         handles.push(thread::spawn(move || -> Result<DaemonBenchSample> {
             barrier.wait();
             let started = Instant::now();
-            let result = run_daemon_search_once(&target, cwd.as_deref(), &query, limit, &filters)?;
+            let result = run_daemon_search_once(
+                &target,
+                cwd.as_deref(),
+                &query,
+                limit,
+                &filters,
+                request_timeout,
+            )?;
             Ok(DaemonBenchSample {
                 result_count: daemon_search_result_count(&result),
                 elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
@@ -7731,6 +7777,7 @@ fn run_daemon_search_once(
     query: &str,
     limit: usize,
     filters: &SearchFilters,
+    request_timeout: Duration,
 ) -> Result<Value> {
     let mut arguments =
         daemon_search_auto_arguments(query, limit, filters, 0, false, false, false, true);
@@ -7740,21 +7787,28 @@ fn run_daemon_search_once(
             Value::String(cwd.to_string_lossy().to_string()),
         );
     }
-    daemon_tool_request_target(target, "search_auto", arguments)
+    daemon_tool_request_target(target, "search_auto", arguments, request_timeout)
 }
 
 fn daemon_tool_request_target(
     target: &DaemonTarget,
     tool: &str,
     arguments: Value,
+    request_timeout: Duration,
 ) -> Result<Value> {
     match target {
         DaemonTarget::Tcp(addr) => {
-            daemon_tool_request_stream(TcpStream::connect(addr)?, tool, arguments)
+            let stream = TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(request_timeout))?;
+            stream.set_write_timeout(Some(request_timeout))?;
+            daemon_tool_request_stream(stream, tool, arguments)
         }
         #[cfg(unix)]
         DaemonTarget::Unix(socket) => {
-            daemon_tool_request_stream(UnixStream::connect(socket)?, tool, arguments)
+            let stream = UnixStream::connect(socket)?;
+            stream.set_read_timeout(Some(request_timeout))?;
+            stream.set_write_timeout(Some(request_timeout))?;
+            daemon_tool_request_stream(stream, tool, arguments)
         }
     }
 }

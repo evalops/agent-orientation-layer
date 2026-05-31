@@ -28,11 +28,11 @@ orient serve-tcp \
 ```
 
 `--index-dir` registers the shard manifest and lazily loads individual repo
-indexes on first use. The daemon keeps at most 64 ready indexes and uses at most
-8 shard workers per query by default; set `--max-cached-indexes N` and
-`ORIENT_MAX_SHARD_WORKERS=N` to tune shared multi-agent runs. Use
-`--warm-index-dir "$ORIENT_SHARDS"` only when you intentionally want to load
-shard indexes at startup.
+indexes on first use. The daemon keeps at most 64 lazy indexes by default; when
+using `--warm-index-dir`, it sizes the default cache to the warmed shard count.
+Set `--max-cached-indexes N` and `ORIENT_MAX_SHARD_WORKERS=N` to tune shared
+multi-agent runs. Use `--warm-index-dir "$ORIENT_SHARDS"` only when you
+intentionally want to load shard indexes at startup.
 
 Then verify the daemon and generate the short instruction snippet:
 
@@ -199,7 +199,7 @@ bazel run //:ci_full_test
 bazel run //:ci_perf_gates
 ORIENT_WIDE_SHARDS=0 bazel run //:ci_wide_perf
 ORIENT_AGENT_ROOT=/path/to/projects tools/ci/orient_agent_query_perf.sh
-orient bench-daemon --addr 127.0.0.1:8796 --cwd . --concurrency 10 "symbol:SessionManager token"
+orient bench-daemon --addr 127.0.0.1:8796 --cwd . --concurrency 10 --request-timeout-ms 30000 "symbol:SessionManager token"
 ```
 
 The wide perf gate chooses the local projects workspace when it exists, then

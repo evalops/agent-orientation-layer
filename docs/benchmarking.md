@@ -35,13 +35,18 @@ orient bench-daemon \
   --concurrency 10 \
   --runs 10 \
   --warmup 2 \
+  --request-timeout-ms 30000 \
   --query "symbol:SessionManager token" \
   --query "file:Cargo.toml"
 ```
 
 `bench-daemon` reports one sample per request, so `sample_count` is
 `runs * concurrency * query_count`. Use `--cwd` to mirror how agent wrappers
-scope shared shard daemons to the current checkout.
+scope shared shard daemons to the current checkout. The request timeout bounds
+each daemon round trip so a stalled daemon fails the benchmark instead of
+hanging the caller. For warmed multi-shard daemons, compare the startup
+`cached_indexes` and `max_cached_indexes` fields; a cache smaller than the shard
+count can turn broad fanout queries into cache churn.
 
 The default query set intentionally mixes:
 
