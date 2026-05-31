@@ -206,14 +206,15 @@ ORIENT_DAEMON_CWD_ROOT=/path/to/projects ORIENT_DAEMON_CWD=/path/to/current-chec
 orient bench-daemon --addr 127.0.0.1:8796 --cwd . --concurrency 10 --request-timeout-ms 30000 "symbol:SessionManager token"
 orient bench-daemon-read --addr 127.0.0.1:8796 --cwd . --concurrency 10 --request-timeout-ms 30000 --range src/main.rs:1:40
 orient bench-daemon-mix --addr 127.0.0.1:8796 --cwd . --concurrency 10 --request-timeout-ms 30000 --query "symbol:SessionManager token" --range src/main.rs:1:40
+orient bench-daemon-churn --addr 127.0.0.1:8796 --cwd . --concurrency 10 --request-timeout-ms 30000 --fail-fallback-rate 0.01
 ```
 
 The wide perf gate chooses the local projects workspace when it exists, then
 falls back to the common code workspace; set `ORIENT_WIDE_ROOT` to force a
 different local root.
 
-`bench-search`, `bench-shards`, `bench-daemon`, `bench-daemon-read`, and
-`bench-daemon-mix` emit
+`bench-search`, `bench-shards`, `bench-daemon`, `bench-daemon-read`,
+`bench-daemon-mix`, and `bench-daemon-churn` emit
 per-query samples plus a compact `summary` with query count, total samples, max
 p95/p99, max sample, and the slowest query. Use `--fail-p95-ms` for hard gates
 and `--baseline` / `--write-baseline` for regression checks. `bench-shards` also
@@ -222,6 +223,9 @@ hits, so slow queries show whether routing or ranking is wasting fanout.
 `bench-daemon` measures concurrent shared-daemon `search_auto` requests;
 `bench-daemon-read` measures concurrent bounded `read_range` follow-ups, and
 `bench-daemon-mix` measures both in the same concurrent agent-style wave.
+`bench-daemon-churn` adds live marker-file edits and reports fallback/stale
+refresh counts, plus a no-edit baseline, while cleaning up its marker files by
+default.
 `orient_daemon_cwd_perf.sh` wraps the daemon flow with shard warmup and
 checkout-scoped `cwd` requests.
 

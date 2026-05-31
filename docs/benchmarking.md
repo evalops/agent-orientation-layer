@@ -15,6 +15,9 @@ Orient has four benchmark layers:
   concurrent bounded `read_range` requests to the daemon.
 - `orient bench-daemon-mix` checks the real agent loop by mixing concurrent
   `search_auto` and `read_range` requests in the same wave.
+- `orient bench-daemon-churn` checks the same mixed path while editing small
+  marker files between waves, so stale-refresh and fallback-cliff behavior are
+  visible under load.
 - `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
   warms shards, scopes requests through a checkout `cwd`, and gates repeated
   concurrent `search_auto` latency for the path coding agents normally use.
@@ -105,6 +108,30 @@ orient bench-daemon-mix \
 
 For `bench-daemon-mix`, labels are prefixed with `search:` or `read:` so the
 same report shows both sides of the agent search-to-read handoff.
+
+Check live-edit behavior with:
+
+```bash
+orient bench-daemon-churn \
+  --addr 127.0.0.1:8796 \
+  --cwd /path/to/current/repo \
+  --concurrency 10 \
+  --runs 10 \
+  --warmup 2 \
+  --baseline-runs 3 \
+  --request-timeout-ms 30000 \
+  --query orient_churn_token \
+  --fail-fallback-rate 0.01
+```
+
+`bench-daemon-churn` writes `orient_churn_token` marker files under
+`.orient-churn-bench` inside `--cwd`, runs `search_auto` with
+`refresh_if_stale:true` and `retry_if_empty:true`, and removes the marker files
+unless `--keep-churn-files` is set. Reports include `fallback_count`,
+`stale_count`, `primary_retry_count`, `refresh_request_count`, `fallback_rate`,
+`churn_writes`, `baseline_max_p95_ms`, and `refresh_overhead_max_p95_ms`.
+`fallback_rate` is measured over search samples. The baseline waves run before
+the edits so refresh cost is visible instead of being hidden inside one p95.
 
 The default query set intentionally mixes:
 

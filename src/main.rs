@@ -43,7 +43,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -1038,6 +1038,47 @@ enum Commands {
         #[arg(long, default_value_t = 0.25)]
         max_p95_regression: f64,
     },
+    BenchDaemonChurn {
+        #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
+        socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "TCP daemon address; falls back to ORIENT_ADDR or 127.0.0.1:8796"
+        )]
+        addr: Option<String>,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 10)]
+        runs: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS)]
+        request_timeout_ms: u64,
+        #[arg(long = "repo-filter")]
+        repo_filter: Option<String>,
+        #[command(flatten)]
+        filters: CommonSearchArgs,
+        #[arg(long = "query", value_name = "QUERY")]
+        query_args: Vec<String>,
+        #[arg(long = "range", value_name = "PATH:START:LINES[:SCOPE]")]
+        range_args: Vec<CliRangeSpec>,
+        #[arg(long, default_value = ".orient-churn-bench")]
+        churn_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        churn_files: usize,
+        #[arg(long, default_value_t = 3)]
+        baseline_runs: usize,
+        #[arg(long)]
+        keep_churn_files: bool,
+        #[arg(long)]
+        fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_fallback_rate: Option<f64>,
+    },
     ToolManifest {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
         format: String,
@@ -1680,6 +1721,22 @@ struct BenchSummary {
     max_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slowest_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_retry_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_request_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    churn_writes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_max_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_overhead_max_p95_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1702,6 +1759,14 @@ struct QueryBench {
     #[serde(default)]
     p99_ms: f64,
     max_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_retry_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_request_count: Option<usize>,
     samples_ms: Vec<f64>,
 }
 
@@ -5946,6 +6011,51 @@ fn run() -> Result<()> {
                 fail_slow_bench_queries(&report, threshold)?;
             }
         }
+        Commands::BenchDaemonChurn {
+            socket,
+            addr,
+            cwd,
+            concurrency,
+            runs,
+            warmup,
+            limit,
+            request_timeout_ms,
+            repo_filter,
+            filters,
+            query_args,
+            range_args,
+            churn_dir,
+            churn_files,
+            baseline_runs,
+            keep_churn_files,
+            fail_p95_ms,
+            fail_fallback_rate,
+        } => {
+            let filters = search_filters_from_args(&filters, repo_filter)?;
+            let operations = cli_benchmark_churn_operations(query_args, range_args)?;
+            let report = bench_daemon_churn(DaemonChurnBenchConfig {
+                target: resolve_daemon_target(socket, addr),
+                cwd,
+                concurrency,
+                runs,
+                warmup,
+                limit,
+                request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
+                filters,
+                operations,
+                churn_dir,
+                churn_files,
+                baseline_runs,
+                cleanup: !keep_churn_files,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            if let Some(threshold) = fail_p95_ms {
+                fail_slow_bench_queries(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_fallback_rate {
+                fail_bench_fallback_rate(&report, threshold)?;
+            }
+        }
         Commands::ToolManifest { format: _format } => {
             println!("{}", serde_json::to_string(&tool_manifest())?);
         }
@@ -7664,6 +7774,18 @@ fn cli_benchmark_mix_operations(
     Ok(operations)
 }
 
+fn cli_benchmark_churn_operations(
+    query_args: Vec<String>,
+    range_args: Vec<CliRangeSpec>,
+) -> Result<Vec<DaemonMixOperation>> {
+    let query_args = if query_args.is_empty() {
+        vec!["orient_churn_token".to_string()]
+    } else {
+        query_args
+    };
+    cli_benchmark_mix_operations(query_args, range_args)
+}
+
 fn cli_range_label(range: &CliRangeSpec) -> String {
     match range.scope {
         Some(scope) => format!(
@@ -7845,10 +7967,56 @@ struct DaemonMixBenchConfig {
     operations: Vec<DaemonMixOperation>,
 }
 
+struct DaemonChurnBenchConfig {
+    target: DaemonTarget,
+    cwd: PathBuf,
+    concurrency: usize,
+    runs: usize,
+    warmup: usize,
+    limit: usize,
+    request_timeout: Duration,
+    filters: SearchFilters,
+    operations: Vec<DaemonMixOperation>,
+    churn_dir: PathBuf,
+    churn_files: usize,
+    baseline_runs: usize,
+    cleanup: bool,
+}
+
 #[derive(Debug, Clone)]
 enum DaemonMixOperation {
     Search(String),
     Read(CliRangeSpec),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DaemonSearchFlags {
+    refresh_if_stale: bool,
+    retry_if_empty: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BenchSampleDiagnostics {
+    fallback_count: usize,
+    stale_count: usize,
+    primary_retry_count: usize,
+    refresh_request_count: usize,
+}
+
+impl BenchSampleDiagnostics {
+    fn add(&mut self, other: &BenchSampleDiagnostics) {
+        self.fallback_count += other.fallback_count;
+        self.stale_count += other.stale_count;
+        self.primary_retry_count += other.primary_retry_count;
+        self.refresh_request_count += other.refresh_request_count;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BenchQueryAccumulator {
+    result_count: usize,
+    samples_ms: Vec<f64>,
+    diagnostics: BenchSampleDiagnostics,
 }
 
 fn bench_search(config: BenchConfig) -> Result<BenchReport> {
@@ -8077,7 +8245,7 @@ fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
             config.operations.len()
         );
     }
-    let mut samples_by_operation = BTreeMap::<String, (usize, Vec<f64>)>::new();
+    let mut samples_by_operation = BTreeMap::<String, BenchQueryAccumulator>::new();
 
     for warmup_index in 0..config.warmup {
         let _ = run_daemon_mix_wave(
@@ -8087,6 +8255,7 @@ fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
             warmup_index * concurrency,
             config.limit,
             &config.filters,
+            DaemonSearchFlags::default(),
             concurrency,
             config.request_timeout,
         )?;
@@ -8100,23 +8269,21 @@ fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
             run_index * concurrency,
             config.limit,
             &config.filters,
+            DaemonSearchFlags::default(),
             concurrency,
             config.request_timeout,
         )?;
         for sample in wave {
-            let entry = samples_by_operation
-                .entry(sample.label)
-                .or_insert_with(|| (0, Vec::new()));
-            entry.0 = sample.result_count;
-            entry.1.push(sample.elapsed_ms);
+            let entry = samples_by_operation.entry(sample.label).or_default();
+            entry.result_count = sample.result_count;
+            entry.samples_ms.push(sample.elapsed_ms);
+            entry.diagnostics.add(&sample.diagnostics);
         }
     }
 
     let query_reports = samples_by_operation
         .into_iter()
-        .map(|(label, (result_count, samples_ms))| {
-            summarize_query(&label, result_count, samples_ms, None, None)
-        })
+        .map(|(label, accumulator)| summarize_accumulated_query(&label, accumulator))
         .collect();
 
     Ok(bench_report(
@@ -8127,6 +8294,117 @@ fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
         Some(concurrency),
         query_reports,
     ))
+}
+
+fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
+    let runs = config.runs.max(1);
+    let concurrency = config.concurrency.max(1);
+    let churn_files = config.churn_files.max(1);
+    let scheduled_samples = runs * concurrency;
+    if scheduled_samples < config.operations.len() {
+        bail!(
+            "runs * concurrency yields {} samples but {} operations were provided; increase --runs or --concurrency",
+            scheduled_samples,
+            config.operations.len()
+        );
+    }
+    let churn_dir = resolve_churn_dir(&config.cwd, &config.churn_dir)?;
+    let mut samples_by_operation = BTreeMap::<String, BenchQueryAccumulator>::new();
+    let search_flags = DaemonSearchFlags {
+        refresh_if_stale: true,
+        retry_if_empty: true,
+    };
+    let baseline_max_p95_ms = if config.baseline_runs == 0 {
+        None
+    } else {
+        let mut baseline_samples = BTreeMap::<String, BenchQueryAccumulator>::new();
+        for run_index in 0..config.baseline_runs {
+            let wave = run_daemon_mix_wave(
+                &config.target,
+                Some(&config.cwd),
+                &config.operations,
+                run_index * concurrency,
+                config.limit,
+                &config.filters,
+                search_flags,
+                concurrency,
+                config.request_timeout,
+            )?;
+            accumulate_daemon_mix_wave(&mut baseline_samples, wave);
+        }
+        let baseline_queries = baseline_samples
+            .into_iter()
+            .map(|(label, accumulator)| summarize_accumulated_query(&label, accumulator))
+            .collect::<Vec<_>>();
+        Some(summarize_bench_report(&baseline_queries).max_p95_ms)
+    };
+    let mut churn_writes = 0usize;
+
+    for warmup_index in 0..config.warmup {
+        churn_writes += write_churn_files(&churn_dir, warmup_index, churn_files)?;
+        let _ = run_daemon_mix_wave(
+            &config.target,
+            Some(&config.cwd),
+            &config.operations,
+            warmup_index * concurrency,
+            config.limit,
+            &config.filters,
+            search_flags,
+            concurrency,
+            config.request_timeout,
+        )?;
+    }
+
+    for run_index in 0..runs {
+        let wave_index = config.warmup + run_index;
+        churn_writes += write_churn_files(&churn_dir, wave_index, churn_files)?;
+        let wave = run_daemon_mix_wave(
+            &config.target,
+            Some(&config.cwd),
+            &config.operations,
+            run_index * concurrency,
+            config.limit,
+            &config.filters,
+            search_flags,
+            concurrency,
+            config.request_timeout,
+        )?;
+        accumulate_daemon_mix_wave(&mut samples_by_operation, wave);
+    }
+
+    if config.cleanup {
+        cleanup_churn_files(&churn_dir, churn_files)?;
+    }
+
+    let query_reports = samples_by_operation
+        .into_iter()
+        .map(|(label, accumulator)| summarize_accumulated_query(&label, accumulator))
+        .collect();
+    let mut report = bench_report(
+        "daemon_churn".to_string(),
+        runs,
+        config.warmup,
+        config.limit,
+        Some(concurrency),
+        query_reports,
+    );
+    report.summary.churn_writes = Some(churn_writes);
+    report.summary.baseline_max_p95_ms = baseline_max_p95_ms;
+    report.summary.refresh_overhead_max_p95_ms = baseline_max_p95_ms
+        .map(|baseline| round_ms((report.summary.max_p95_ms - baseline).max(0.0)));
+    Ok(report)
+}
+
+fn accumulate_daemon_mix_wave(
+    samples_by_operation: &mut BTreeMap<String, BenchQueryAccumulator>,
+    wave: Vec<DaemonMixBenchSample>,
+) {
+    for sample in wave {
+        let entry = samples_by_operation.entry(sample.label).or_default();
+        entry.result_count = sample.result_count;
+        entry.samples_ms.push(sample.elapsed_ms);
+        entry.diagnostics.add(&sample.diagnostics);
+    }
 }
 
 fn bench_report(
@@ -8156,6 +8434,7 @@ struct DaemonBenchSample {
 struct DaemonMixBenchSample {
     label: String,
     result_count: usize,
+    diagnostics: BenchSampleDiagnostics,
     elapsed_ms: f64,
 }
 
@@ -8185,6 +8464,7 @@ fn run_daemon_search_wave(
                 &query,
                 limit,
                 &filters,
+                DaemonSearchFlags::default(),
                 request_timeout,
             )?;
             Ok(DaemonBenchSample {
@@ -8246,6 +8526,7 @@ fn run_daemon_mix_wave(
     operation_offset: usize,
     limit: usize,
     filters: &SearchFilters,
+    search_flags: DaemonSearchFlags,
     concurrency: usize,
     request_timeout: Duration,
 ) -> Result<Vec<DaemonMixBenchSample>> {
@@ -8263,7 +8544,7 @@ fn run_daemon_mix_wave(
         handles.push(thread::spawn(move || -> Result<DaemonMixBenchSample> {
             barrier.wait();
             let started = Instant::now();
-            let (label, result_count) = match operation {
+            let (label, result_count, diagnostics) = match operation {
                 DaemonMixOperation::Search(query) => {
                     let result = run_daemon_search_once(
                         &target,
@@ -8271,11 +8552,13 @@ fn run_daemon_mix_wave(
                         &query,
                         limit,
                         &filters,
+                        search_flags,
                         request_timeout,
                     )?;
                     (
                         daemon_mix_search_label(&query),
                         daemon_search_result_count(&result),
+                        daemon_search_sample_diagnostics(&result),
                     )
                 }
                 DaemonMixOperation::Read(range) => {
@@ -8284,12 +8567,14 @@ fn run_daemon_mix_wave(
                     (
                         daemon_mix_read_label(&range),
                         daemon_read_line_count(&result),
+                        BenchSampleDiagnostics::default(),
                     )
                 }
             };
             Ok(DaemonMixBenchSample {
                 label,
                 result_count,
+                diagnostics,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
             })
         }));
@@ -8311,10 +8596,19 @@ fn run_daemon_search_once(
     query: &str,
     limit: usize,
     filters: &SearchFilters,
+    flags: DaemonSearchFlags,
     request_timeout: Duration,
 ) -> Result<Value> {
-    let mut arguments =
-        daemon_search_auto_arguments(query, limit, filters, 0, false, false, false, true);
+    let mut arguments = daemon_search_auto_arguments(
+        query,
+        limit,
+        filters,
+        0,
+        flags.refresh_if_stale,
+        false,
+        flags.retry_if_empty,
+        true,
+    );
     if let (Value::Object(arguments), Some(cwd)) = (&mut arguments, cwd) {
         arguments.insert(
             "cwd".to_string(),
@@ -8385,12 +8679,82 @@ fn daemon_search_result_count(result: &Value) -> usize {
         .unwrap_or(0)
 }
 
+fn daemon_search_sample_diagnostics(result: &Value) -> BenchSampleDiagnostics {
+    BenchSampleDiagnostics {
+        fallback_count: usize::from(
+            result
+                .get("surface")
+                .and_then(Value::as_str)
+                .is_some_and(|surface| surface == "fallback"),
+        ),
+        stale_count: usize::from(
+            result
+                .get("freshness")
+                .and_then(|freshness| freshness.get("stale"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        primary_retry_count: usize::from(result.get("primary_retry_result").is_some()),
+        refresh_request_count: usize::from(result.get("refresh_request").is_some()),
+    }
+}
+
 fn daemon_mix_search_label(query: &str) -> String {
     format!("search:{query}")
 }
 
 fn daemon_mix_read_label(range: &CliRangeSpec) -> String {
     format!("read:{}", cli_range_label(range))
+}
+
+fn resolve_churn_dir(cwd: &Path, churn_dir: &Path) -> Result<PathBuf> {
+    if !cwd.is_dir() {
+        bail!("--cwd must be an existing directory for churn benchmarks");
+    }
+    if churn_dir.is_absolute() {
+        if !churn_dir.starts_with(cwd) {
+            bail!("--churn-dir must stay under --cwd");
+        }
+        return Ok(churn_dir.to_path_buf());
+    }
+    if churn_dir.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("--churn-dir must be a relative path under --cwd");
+    }
+    Ok(cwd.join(churn_dir))
+}
+
+fn write_churn_files(churn_dir: &Path, wave_index: usize, churn_files: usize) -> Result<usize> {
+    fs::create_dir_all(churn_dir)?;
+    for file_index in 0..churn_files {
+        let path = churn_dir.join(churn_file_name(file_index));
+        fs::write(
+            path,
+            format!(
+                "pub fn orient_churn_function_{file_index}() -> &'static str {{ \"orient_churn_token wave_{wave_index} file_{file_index}\" }}\n"
+            ),
+        )?;
+    }
+    Ok(churn_files)
+}
+
+fn cleanup_churn_files(churn_dir: &Path, churn_files: usize) -> Result<()> {
+    for file_index in 0..churn_files {
+        let path = churn_dir.join(churn_file_name(file_index));
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    let _ = fs::remove_dir(churn_dir);
+    Ok(())
+}
+
+fn churn_file_name(file_index: usize) -> String {
+    format!("orient_churn_{file_index}.rs")
 }
 
 fn daemon_read_line_count(result: &Value) -> usize {
@@ -8464,8 +8828,27 @@ fn summarize_query(
         p95_ms: round_ms(p95_ms),
         p99_ms: round_ms(p99_ms),
         max_ms: round_ms(max_ms),
+        fallback_count: None,
+        stale_count: None,
+        primary_retry_count: None,
+        refresh_request_count: None,
         samples_ms: samples_ms.into_iter().map(round_ms).collect(),
     }
+}
+
+fn summarize_accumulated_query(query: &str, accumulator: BenchQueryAccumulator) -> QueryBench {
+    let mut summary = summarize_query(
+        query,
+        accumulator.result_count,
+        accumulator.samples_ms,
+        None,
+        None,
+    );
+    summary.fallback_count = Some(accumulator.diagnostics.fallback_count);
+    summary.stale_count = Some(accumulator.diagnostics.stale_count);
+    summary.primary_retry_count = Some(accumulator.diagnostics.primary_retry_count);
+    summary.refresh_request_count = Some(accumulator.diagnostics.refresh_request_count);
+    summary
 }
 
 #[derive(Debug, Clone)]
@@ -8510,6 +8893,27 @@ fn summarize_bench_report(queries: &[QueryBench]) -> BenchSummary {
     let slowest = queries
         .iter()
         .max_by(|left, right| left.p95_ms.total_cmp(&right.p95_ms));
+    let fallback_count = queries
+        .iter()
+        .map(|query| query.fallback_count.unwrap_or(0))
+        .sum::<usize>();
+    let stale_count = queries
+        .iter()
+        .map(|query| query.stale_count.unwrap_or(0))
+        .sum::<usize>();
+    let primary_retry_count = queries
+        .iter()
+        .map(|query| query.primary_retry_count.unwrap_or(0))
+        .sum::<usize>();
+    let refresh_request_count = queries
+        .iter()
+        .map(|query| query.refresh_request_count.unwrap_or(0))
+        .sum::<usize>();
+    let search_sample_count = queries
+        .iter()
+        .filter(|query| query.query.starts_with("search:"))
+        .map(|query| query.samples_ms.len())
+        .sum::<usize>();
     BenchSummary {
         query_count: queries.len(),
         sample_count: queries.iter().map(|query| query.samples_ms.len()).sum(),
@@ -8529,7 +8933,33 @@ fn summarize_bench_report(queries: &[QueryBench]) -> BenchSummary {
             .max_by(f64::total_cmp)
             .unwrap_or(0.0),
         slowest_query: slowest.map(|query| query.query.clone()),
+        fallback_count: bench_count_if_present(fallback_count, queries),
+        stale_count: bench_count_if_present(stale_count, queries),
+        primary_retry_count: bench_count_if_present(primary_retry_count, queries),
+        refresh_request_count: bench_count_if_present(refresh_request_count, queries),
+        fallback_rate: if search_sample_count == 0 && fallback_count == 0 {
+            None
+        } else {
+            Some(round_ratio(
+                fallback_count as f64 / search_sample_count.max(1) as f64,
+            ))
+        },
+        churn_writes: None,
+        baseline_max_p95_ms: None,
+        refresh_overhead_max_p95_ms: None,
     }
+}
+
+fn bench_count_if_present(count: usize, queries: &[QueryBench]) -> Option<usize> {
+    queries
+        .iter()
+        .any(|query| {
+            query.fallback_count.is_some()
+                || query.stale_count.is_some()
+                || query.primary_retry_count.is_some()
+                || query.refresh_request_count.is_some()
+        })
+        .then_some(count)
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {
@@ -8616,6 +9046,18 @@ fn fail_slow_bench_queries(report: &BenchReport, threshold: f64) -> Result<()> {
             "p95 {:.3}ms for query {:?} exceeded threshold {:.3}ms",
             slowest.p95_ms,
             slowest.query,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_bench_fallback_rate(report: &BenchReport, threshold: f64) -> Result<()> {
+    let fallback_rate = report.summary.fallback_rate.unwrap_or(0.0);
+    if fallback_rate > threshold {
+        bail!(
+            "fallback rate {:.3} exceeded threshold {:.3}",
+            fallback_rate,
             threshold
         );
     }
