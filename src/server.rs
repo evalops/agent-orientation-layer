@@ -48,12 +48,13 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 pub const MAX_BATCH_QUERIES: usize = 32;
 pub const MAX_BATCH_RANGES: usize = 64;
 pub const DEFAULT_MAX_CACHED_INDEXES: usize = 64;
 const MAX_COMPLETED_SHARD_WORK_CACHE: usize = 128;
+const SHARD_FRESHNESS_CACHE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8796";
 const MAX_DAEMON_SHARD_WORKERS_ENV: &str = "ORIENT_MAX_DAEMON_SHARD_WORKERS";
 
@@ -1057,6 +1058,8 @@ pub struct ToolRuntime {
         Mutex<HashMap<ShardQueryPlanKey, CachedCompletedWork<Vec<ShardQueryPlan>>>>,
     completed_shard_route_stats:
         Mutex<HashMap<ShardQueryPlanKey, CachedCompletedWork<ShardRouteStats>>>,
+    completed_shard_freshness:
+        Mutex<HashMap<ShardFreshnessKey, CachedTimedCompletedWork<ShardFreshness>>>,
     coalesced_shard_search_waiters: AtomicU64,
     coalesced_shard_query_plan_waiters: AtomicU64,
     completed_shard_search_hits: AtomicU64,
@@ -1084,6 +1087,7 @@ impl Default for ToolRuntime {
             completed_shard_searches: Mutex::new(HashMap::new()),
             completed_shard_query_plans: Mutex::new(HashMap::new()),
             completed_shard_route_stats: Mutex::new(HashMap::new()),
+            completed_shard_freshness: Mutex::new(HashMap::new()),
             coalesced_shard_search_waiters: AtomicU64::new(0),
             coalesced_shard_query_plan_waiters: AtomicU64::new(0),
             completed_shard_search_hits: AtomicU64::new(0),
@@ -1126,9 +1130,22 @@ struct ShardQueryPlanKey {
     epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShardFreshnessKey {
+    index_dir: PathBuf,
+    roots: Vec<PathBuf>,
+    epoch: u64,
+}
+
 struct CachedCompletedWork<T> {
     value: T,
     last_access: u64,
+}
+
+struct CachedTimedCompletedWork<T> {
+    value: T,
+    last_access: u64,
+    stored_at: Instant,
 }
 
 struct InFlightWork<T> {
@@ -3381,7 +3398,7 @@ fn shard_freshness_roots_for_search(
             .map(|shard| shard.root.clone())
             .collect();
     }
-    if has_positive_selector {
+    if filters.branch.is_some() || filters.origin.is_some() {
         if let Some(root) = live_cwd_shard_root_matching_filters(index_dir, arguments, filters)? {
             roots.push(root);
         }
@@ -7351,7 +7368,7 @@ impl ToolRuntime {
         if roots.is_empty() {
             return Ok(None);
         }
-        let status = shard_status_by_root(index_dir, &roots)?;
+        let status = self.cached_shard_freshness_by_root(index_dir, &roots)?;
         if !status.stale {
             return Ok(None);
         }
@@ -7459,6 +7476,10 @@ impl ToolRuntime {
         self.completed_shard_route_stats
             .lock()
             .map_err(|_| anyhow!("completed shard route cache lock poisoned"))?
+            .clear();
+        self.completed_shard_freshness
+            .lock()
+            .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?
             .clear();
         self.completed_shard_cache_epoch
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -7582,6 +7603,57 @@ impl ToolRuntime {
         );
         evict_oldest_completed_work(&mut routes, MAX_COMPLETED_SHARD_WORK_CACHE);
         Ok(stats)
+    }
+
+    fn cached_shard_freshness_by_root(
+        &self,
+        index_dir: &Path,
+        roots: &[PathBuf],
+    ) -> Result<ShardFreshness> {
+        let mut roots = roots
+            .iter()
+            .map(|root| canonical_cache_key(root))
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        let key = ShardFreshnessKey {
+            index_dir: canonical_cache_key(index_dir),
+            roots,
+            epoch: self.completed_shard_cache_epoch(),
+        };
+        let now = Instant::now();
+        let access = self.next_completed_shard_cache_access();
+        {
+            let mut entries = self
+                .completed_shard_freshness
+                .lock()
+                .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?;
+            if let Some(entry) = entries.get_mut(&key) {
+                if now.duration_since(entry.stored_at) <= SHARD_FRESHNESS_CACHE_TTL {
+                    entry.last_access = access;
+                    return Ok(entry.value.clone());
+                }
+                entries.remove(&key);
+            }
+        }
+
+        let status = shard_status_by_root(index_dir, &key.roots)?;
+        let stored_at = Instant::now();
+        let access = self.next_completed_shard_cache_access();
+        let mut entries = self
+            .completed_shard_freshness
+            .lock()
+            .map_err(|_| anyhow!("completed shard freshness cache lock poisoned"))?;
+        entries.insert(
+            key,
+            CachedTimedCompletedWork {
+                value: status.clone(),
+                last_access: access,
+                stored_at,
+            },
+        );
+        evict_oldest_timed_completed_work(&mut entries, MAX_COMPLETED_SHARD_WORK_CACHE);
+        Ok(status)
     }
 
     fn replace_cached_index(&self, index_path: PathBuf, index: Arc<FastIndex>) -> Result<PathBuf> {
@@ -8809,6 +8881,22 @@ fn canonical_cache_key(path: &Path) -> PathBuf {
 
 fn evict_oldest_completed_work<K: Clone + Eq + Hash, T>(
     cache: &mut HashMap<K, CachedCompletedWork<T>>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&victim);
+    }
+}
+
+fn evict_oldest_timed_completed_work<K: Clone + Eq + Hash, T>(
+    cache: &mut HashMap<K, CachedTimedCompletedWork<T>>,
     max_entries: usize,
 ) {
     while cache.len() > max_entries {
