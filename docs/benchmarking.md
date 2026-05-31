@@ -158,9 +158,14 @@ orient bench-daemon-contend \
 values, chooses search/read operations round-robin per client, and sleeps a
 deterministic jitter between operations. It reports `sample_count` as
 `clients * runs`, keeps per-operation p50/p95/p99/max samples, and adds
-`wall_ms` plus `ops_per_sec` to the summary. Use it when several local agent
-processes share one daemon and you care about contention rather than a single
-synchronized wave.
+`wall_ms`, `ops_per_sec`, `first_wave_p95_ms`, and `first_wave_max_ms` to the
+summary. Use it when several local agent processes share one daemon and you care
+about contention rather than a single synchronized wave.
+
+For cold-start behavior, start a fresh daemon and run the same command with
+`--warmup 0`. The first-wave fields then show the initial concurrent touch cost.
+Run it again with the normal warmup value to compare cold first touch against
+steady shared-daemon behavior.
 
 The default query set intentionally mixes:
 

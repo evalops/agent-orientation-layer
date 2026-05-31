@@ -12332,6 +12332,14 @@ fn tcp_daemon_contention_bench_reports_multi_client_search_and_read_latency() {
     assert_eq!(report["summary"]["sample_count"], serde_json::json!(12));
     assert!(report["summary"]["ops_per_sec"].as_f64().unwrap() > 0.0);
     assert!(report["summary"]["wall_ms"].as_f64().unwrap() >= 0.0);
+    assert!(
+        report["summary"]["first_wave_p95_ms"].as_f64().unwrap() >= 0.0,
+        "{report}"
+    );
+    assert!(
+        report["summary"]["first_wave_max_ms"].as_f64().unwrap() >= 0.0,
+        "{report}"
+    );
     let labels = report["queries"]
         .as_array()
         .unwrap()

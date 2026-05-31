@@ -1776,6 +1776,10 @@ struct BenchSummary {
     wall_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ops_per_sec: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_wave_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_wave_max_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8496,6 +8500,7 @@ fn bench_daemon_contend(config: DaemonContentionBenchConfig) -> Result<BenchRepo
     let started = Instant::now();
     let samples = run_daemon_contention_clients(&config, clients, runs, config.warmup)?;
     let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let first_wave_stats = contention_first_wave_stats(&samples);
     accumulate_daemon_mix_wave(&mut samples_by_operation, samples);
     let query_reports = samples_by_operation
         .into_iter()
@@ -8515,7 +8520,26 @@ fn bench_daemon_contend(config: DaemonContentionBenchConfig) -> Result<BenchRepo
             report.summary.sample_count as f64 / (wall_ms / 1_000.0),
         ));
     }
+    if let Some((p95_ms, max_ms)) = first_wave_stats {
+        report.summary.first_wave_p95_ms = Some(p95_ms);
+        report.summary.first_wave_max_ms = Some(max_ms);
+    }
     Ok(report)
+}
+
+fn contention_first_wave_stats(samples: &[DaemonMixBenchSample]) -> Option<(f64, f64)> {
+    let mut first_wave = samples
+        .iter()
+        .filter(|sample| sample.measured_iteration == 0)
+        .map(|sample| sample.elapsed_ms)
+        .collect::<Vec<_>>();
+    if first_wave.is_empty() {
+        return None;
+    }
+    first_wave.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95_ms = percentile(&first_wave, 0.95);
+    let max_ms = *first_wave.last().unwrap_or(&0.0);
+    Some((round_ms(p95_ms), round_ms(max_ms)))
 }
 
 fn accumulate_daemon_mix_wave(
@@ -8559,6 +8583,7 @@ struct DaemonMixBenchSample {
     result_count: usize,
     diagnostics: BenchSampleDiagnostics,
     elapsed_ms: f64,
+    measured_iteration: usize,
 }
 
 fn run_daemon_search_wave(
@@ -8699,6 +8724,7 @@ fn run_daemon_mix_wave(
                 result_count,
                 diagnostics,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                measured_iteration: 0,
             })
         }));
     }
@@ -8777,6 +8803,7 @@ fn run_daemon_contention_clients(
                             result_count,
                             diagnostics,
                             elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                            measured_iteration: iteration - warmup,
                         });
                     }
                 }
@@ -9173,6 +9200,8 @@ fn summarize_bench_report(queries: &[QueryBench]) -> BenchSummary {
         refresh_overhead_max_p95_ms: None,
         wall_ms: None,
         ops_per_sec: None,
+        first_wave_p95_ms: None,
+        first_wave_max_ms: None,
     }
 }
 

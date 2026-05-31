@@ -228,7 +228,8 @@ hits, so slow queries show whether routing or ranking is wasting fanout.
 refresh counts, plus a no-edit baseline, while cleaning up its marker files by
 default.
 `bench-daemon-contend` runs many jittered client loops against one daemon and
-reports `wall_ms` plus `ops_per_sec` for shared-daemon tail-latency checks.
+reports `wall_ms`, `ops_per_sec`, and first-wave latency for shared-daemon
+tail-latency and cold-touch checks.
 `orient_daemon_cwd_perf.sh` wraps the daemon flow with shard warmup and
 checkout-scoped `cwd` requests.
 
