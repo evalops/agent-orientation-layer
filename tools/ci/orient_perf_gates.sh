@@ -96,11 +96,14 @@ for index in $(seq 0 95); do
 pub fn commonroutegate() -> usize { ${index} }
 pub fn read() -> usize { ${index} }
 pub fn range() -> usize { ${index} }
+pub fn token() -> usize { ${index} }
+// Noisy prose: route symbol token decoys should not satisfy symbol filters.
 EOF
 done
 cat >> "${route_workspace}/route-repo-42/src/lib.rs" <<'EOF'
 pub fn unique42needle() -> usize { 42 }
 pub fn read_range() -> usize { 42 }
+pub struct RouteSymbolManager;
 EOF
 
 target/release/orient ensure-shards \
@@ -132,3 +135,16 @@ target/release/orient bench-shards \
   --limit 10 \
   --fail-p95-ms 50 \
   "read_range"
+target/release/orient search \
+  --index-dir "${route_shard_dir}" \
+  --query "symbol:RouteSymbolManager token" \
+  --limit 10 \
+  | grep -q "route-repo-42/src/lib.rs"
+target/release/orient bench-shards \
+  --index-dir "${route_shard_dir}" \
+  --cached \
+  --runs 5 \
+  --warmup 1 \
+  --limit 10 \
+  --fail-p95-ms 50 \
+  "symbol:RouteSymbolManager token"

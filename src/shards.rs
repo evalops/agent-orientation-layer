@@ -1,7 +1,7 @@
 //! Multi-repo shard manifests for local indexed search.
 
 use crate::discover::{RepoGitMetadata, git_metadata_for_repo};
-use crate::fast_index::{FastIndex, IndexFreshness, IndexStats};
+use crate::fast_index::{FastIndex, IndexFreshness, IndexStats, IndexedSymbol};
 use crate::query::{merge_filters, parse_query, query_text, query_with_filters_text};
 use crate::repo_index::{
     CommandHint, FileRange, QueryPlan, QueryPlanFilter, QueryPlanNextAction, QueryPlanRepairHint,
@@ -27,9 +27,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SHARD_MANIFEST_FORMAT_VERSION: u32 = 1;
 const SHARD_MANIFEST_VERSION: u32 = SHARD_MANIFEST_FORMAT_VERSION;
-const SHARD_MANIFEST_SIDECAR_VERSION: u32 = 2;
+const SHARD_MANIFEST_SIDECAR_VERSION: u32 = 3;
 const SHARD_MANIFEST_PREFILTER_VERSION: u32 = 3;
-const SHARD_MANIFEST_ROUTE_VERSION: u32 = 12;
+const SHARD_MANIFEST_ROUTE_VERSION: u32 = 13;
 const SHARD_MANIFEST_FILE: &str = "manifest.json";
 const SHARD_MANIFEST_SIDECAR_FILE: &str = "manifest.bin";
 const SHARD_MANIFEST_PREFILTER_FILE: &str = "manifest.prefilter.bin";
@@ -109,6 +109,7 @@ struct ShardRouteEntry {
     aliases: Vec<ShardRouteAlias>,
     git: Option<ShardRouteGitMetadata>,
     substring_bits: Vec<u64>,
+    symbol_substring_bits: Vec<u64>,
     symbol_kind_bits: Vec<u64>,
     filter_bits: Vec<u64>,
 }
@@ -163,6 +164,7 @@ struct ShardRouteRequirements {
     exact_hashes: Vec<u32>,
     trigram_hashes: Vec<u32>,
     substring_grams: Vec<String>,
+    symbol_substring_grams: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +200,8 @@ pub struct ShardQuerySketch {
     #[serde(default)]
     pub substring_bits: Vec<u64>,
     #[serde(default)]
+    pub symbol_substring_bits: Vec<u64>,
+    #[serde(default)]
     pub symbol_kind_bits: Vec<u64>,
     #[serde(default)]
     pub filter_bits: Vec<u64>,
@@ -229,6 +233,11 @@ impl ShardRouteEntry {
                 .sketch
                 .as_ref()
                 .map(|sketch| sketch.substring_bits.clone())
+                .unwrap_or_default(),
+            symbol_substring_bits: shard
+                .sketch
+                .as_ref()
+                .map(|sketch| sketch.symbol_substring_bits.clone())
                 .unwrap_or_default(),
             symbol_kind_bits: shard
                 .sketch
@@ -2389,6 +2398,7 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
     );
     let mut trigram_bits = vec![0; SHARD_TRIGRAM_SKETCH_WORDS];
     let mut substring_bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
+    let mut symbol_substring_bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
     let mut symbol_kind_bits = vec![0; SHARD_KIND_SKETCH_WORDS];
     let mut filter_bits = vec![0; SHARD_FILTER_SKETCH_WORDS];
 
@@ -2407,6 +2417,9 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
         push_content_identifier_hashes(&file.content, &mut exact_hashes);
         push_content_substring_grams(&file.content, &mut substring_bits);
         push_normalized_content_identifier_substring_grams(&file.content, &mut substring_bits);
+        for symbol in &file.symbols {
+            push_symbol_substring_grams(symbol, &mut symbol_substring_bits);
+        }
     }
     exact_hashes.sort_unstable();
     exact_hashes.dedup();
@@ -2433,6 +2446,7 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
         exact_bits: Vec::new(),
         trigram_bits,
         substring_bits,
+        symbol_substring_bits,
         symbol_kind_bits,
         filter_bits,
     }
@@ -2605,6 +2619,19 @@ fn push_normalized_identifier_substring_grams(identifier: &mut String, substring
     identifier.clear();
 }
 
+fn push_symbol_substring_grams(symbol: &IndexedSymbol, symbol_substring_bits: &mut [u64]) {
+    let normalized = if symbol.normalized.is_empty() {
+        normalize_token(&symbol.name)
+    } else {
+        symbol.normalized.clone()
+    };
+    if normalized.chars().count() >= SHARD_ROUTE_SUBSTRING_GRAM_CHARS {
+        for gram in shard_query_substring_grams(&normalized) {
+            sketch_insert(symbol_substring_bits, &gram);
+        }
+    }
+}
+
 fn push_segment_substring_grams(segment: &mut String, substring_bits: &mut [u64]) {
     if segment.chars().count() >= SHARD_ROUTE_SUBSTRING_GRAM_CHARS {
         for gram in shard_query_substring_grams(segment) {
@@ -2716,9 +2743,18 @@ fn route_filter_substring_grams(filters: &SearchFilters) -> Vec<String> {
     {
         grams.extend(shard_query_substring_grams(&route_substring_value(value)));
     }
-    if let Some(symbol) = &filters.symbol {
-        grams.extend(shard_query_substring_grams(&normalize_token(symbol)));
-    }
+    grams.sort();
+    grams.dedup();
+    grams
+}
+
+fn route_symbol_filter_substring_grams(filters: &SearchFilters) -> Vec<String> {
+    let mut grams = filters
+        .symbol
+        .as_deref()
+        .map(normalize_token)
+        .map(|symbol| shard_query_substring_grams(&symbol))
+        .unwrap_or_default();
     grams.sort();
     grams.dedup();
     grams
@@ -2893,7 +2929,8 @@ fn shard_route_stats(
     let has_route_requirements = !requirements.decisive_exact_hashes.is_empty()
         || !requirements.exact_hashes.is_empty()
         || !requirements.trigram_hashes.is_empty()
-        || !requirements.substring_grams.is_empty();
+        || !requirements.substring_grams.is_empty()
+        || !requirements.symbol_substring_grams.is_empty();
     if !has_route_requirements && !shard_route_filter_only_selectable(filters) {
         let total_shards = load_manifest(index_dir)?.shards.len();
         return Ok(shard_route_stats_value(
@@ -2996,7 +3033,8 @@ pub(crate) fn shard_route_selection(
     let has_route_requirements = !requirements.decisive_exact_hashes.is_empty()
         || !requirements.exact_hashes.is_empty()
         || !requirements.trigram_hashes.is_empty()
-        || !requirements.substring_grams.is_empty();
+        || !requirements.substring_grams.is_empty()
+        || !requirements.symbol_substring_grams.is_empty();
     if !has_route_requirements && !shard_route_filter_only_selectable(filters) {
         return Ok(None);
     }
@@ -3056,6 +3094,7 @@ fn shard_route_filter_only_selectable(filters: &SearchFilters) -> bool {
         || filters.code.is_some()
         || !route_filter_exact_hashes(filters).is_empty()
         || !route_filter_substring_grams(filters).is_empty()
+        || !route_symbol_filter_substring_grams(filters).is_empty()
 }
 
 fn shard_entries_to_jobs(
@@ -3155,6 +3194,22 @@ fn shard_route_candidate_ids(
                 .collect(),
         );
     }
+    if !requirements.symbol_substring_grams.is_empty() {
+        let ids = candidate_ids.take().unwrap_or_else(|| {
+            (0..route.shards.len())
+                .filter_map(|id| u16::try_from(id).ok())
+                .collect()
+        });
+        candidate_ids = Some(
+            ids.into_iter()
+                .filter(|id| {
+                    route.shards.get(*id as usize).is_some_and(|shard| {
+                        shard_route_symbol_substrings_may_match(shard, requirements)
+                    })
+                })
+                .collect(),
+        );
+    }
     match candidate_ids {
         Some(candidate_ids) => ShardRouteLookup::Candidates(candidate_ids),
         None if saw_missing => ShardRouteLookup::MissingHash,
@@ -3172,6 +3227,17 @@ fn shard_route_substrings_may_match(
             .substring_grams
             .iter()
             .all(|gram| sketch_contains(&shard.substring_bits, gram))
+}
+
+fn shard_route_symbol_substrings_may_match(
+    shard: &ShardRouteEntry,
+    requirements: &ShardRouteRequirements,
+) -> bool {
+    !shard.symbol_substring_bits.is_empty()
+        && requirements
+            .symbol_substring_grams
+            .iter()
+            .all(|gram| sketch_contains(&shard.symbol_substring_bits, gram))
 }
 
 fn shard_route_filters_may_match(shard: &ShardRouteEntry, filters: &SearchFilters) -> bool {
@@ -3228,6 +3294,7 @@ fn shard_route_requirements(shard_query: &str, filters: &SearchFilters) -> Shard
     substring_grams.extend(route_filter_substring_grams(filters));
     substring_grams.sort();
     substring_grams.dedup();
+    let symbol_substring_grams = route_symbol_filter_substring_grams(filters);
     trigram_hashes.sort_unstable();
     trigram_hashes.dedup();
     ShardRouteRequirements {
@@ -3235,6 +3302,7 @@ fn shard_route_requirements(shard_query: &str, filters: &SearchFilters) -> Shard
         exact_hashes,
         trigram_hashes,
         substring_grams,
+        symbol_substring_grams,
     }
 }
 
@@ -4093,6 +4161,7 @@ mod tests {
             exact_hashes: hashes.to_vec(),
             trigram_hashes: Vec::new(),
             substring_grams: Vec::new(),
+            symbol_substring_grams: Vec::new(),
         }
     }
 
@@ -4102,6 +4171,7 @@ mod tests {
             exact_hashes: Vec::new(),
             trigram_hashes: hashes.to_vec(),
             substring_grams: Vec::new(),
+            symbol_substring_grams: Vec::new(),
         }
     }
 
@@ -4111,6 +4181,7 @@ mod tests {
             exact_hashes: Vec::new(),
             trigram_hashes: Vec::new(),
             substring_grams: shard_query_substring_grams(value),
+            symbol_substring_grams: Vec::new(),
         }
     }
 
@@ -4123,6 +4194,14 @@ mod tests {
     fn normalized_identifier_substring_bits_for(value: &str) -> Vec<u64> {
         let mut bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
         push_normalized_content_identifier_substring_grams(value, &mut bits);
+        bits
+    }
+
+    fn symbol_substring_bits_for(value: &str) -> Vec<u64> {
+        let mut bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
+        for gram in shard_query_substring_grams(&normalize_token(value)) {
+            sketch_insert(&mut bits, &gram);
+        }
         bits
     }
 
@@ -4191,6 +4270,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: substring_bits_for("routeprobe"),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: vec![1],
             filter_bits: vec![2],
         });
@@ -4322,6 +4402,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: rust_filter_bits,
         });
@@ -4334,6 +4415,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: python_filter_bits,
         });
@@ -4472,6 +4554,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
                 }),
@@ -4526,6 +4609,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
                 }),
@@ -4629,6 +4713,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
                 }),
@@ -4714,6 +4799,7 @@ mod tests {
                     exact_bits: Vec::new(),
                     trigram_bits: Vec::new(),
                     substring_bits: Vec::new(),
+                    symbol_substring_bits: Vec::new(),
                     symbol_kind_bits: Vec::new(),
                     filter_bits: Vec::new(),
                 }),
@@ -4767,6 +4853,7 @@ mod tests {
                 exact_bits: Vec::new(),
                 trigram_bits: Vec::new(),
                 substring_bits: Vec::new(),
+                symbol_substring_bits: Vec::new(),
                 symbol_kind_bits: Vec::new(),
                 filter_bits: Vec::new(),
             }),
@@ -4813,6 +4900,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
         });
@@ -4822,6 +4910,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: Vec::new(),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
         });
@@ -4853,6 +4942,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: substring_bits_for("prefix_trigramprobesuffix"),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
         });
@@ -4862,6 +4952,7 @@ mod tests {
             exact_bits: Vec::new(),
             trigram_bits: Vec::new(),
             substring_bits: substring_bits_for("trigram and probe appear apart"),
+            symbol_substring_bits: Vec::new(),
             symbol_kind_bits: Vec::new(),
             filter_bits: Vec::new(),
         });
@@ -4902,12 +4993,18 @@ mod tests {
                 exact_bits: Vec::new(),
                 trigram_bits: Vec::new(),
                 substring_bits: Vec::new(),
+                symbol_substring_bits: Vec::new(),
                 symbol_kind_bits: Vec::new(),
                 filter_bits: Vec::new(),
             });
         }
         manifest.shards[0].sketch.as_mut().unwrap().substring_bits =
             normalized_identifier_substring_bits_for("pub struct SessionManager;");
+        manifest.shards[0]
+            .sketch
+            .as_mut()
+            .unwrap()
+            .symbol_substring_bits = symbol_substring_bits_for("SessionManager");
         manifest.shards[1].sketch.as_mut().unwrap().substring_bits =
             substring_bits_for("session manager token");
         save_manifest(dir.path(), &manifest).unwrap();
@@ -4990,6 +5087,7 @@ mod tests {
                 aliases: Vec::new(),
                 git: None,
                 substring_bits: Vec::new(),
+                symbol_substring_bits: Vec::new(),
                 symbol_kind_bits: Vec::new(),
                 filter_bits: Vec::new(),
             }],
