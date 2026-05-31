@@ -13,6 +13,7 @@ cd "${BUILD_WORKSPACE_DIRECTORY:-$(pwd)}"
 cargo build --release
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/orient-perf-gates.XXXXXX")"
+socket_dir="$(mktemp -d "/tmp/orient-perf-sock.XXXXXX")"
 daemon_pid=""
 cleanup() {
   if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
@@ -20,6 +21,7 @@ cleanup() {
     wait "${daemon_pid}" 2>/dev/null || true
   fi
   rm -rf "${tmpdir}"
+  rm -rf "${socket_dir}"
 }
 trap cleanup EXIT
 index_path="${tmpdir}/orient.index"
@@ -30,8 +32,9 @@ route_workspace="${tmpdir}/route-workspace"
 route_shard_dir="${tmpdir}/route-shards"
 churn_repo="${tmpdir}/churn-repo"
 churn_shard_dir="${tmpdir}/churn-shards"
-cold_daemon_addr="${ORIENT_PERF_GATES_COLD_DAEMON_ADDR:-127.0.0.1:8794}"
-mixed_daemon_addr="${ORIENT_PERF_GATES_MIXED_DAEMON_ADDR:-127.0.0.1:8798}"
+cold_daemon_socket="${ORIENT_PERF_GATES_COLD_DAEMON_SOCKET:-${socket_dir}/cold.sock}"
+mixed_daemon_socket="${ORIENT_PERF_GATES_MIXED_DAEMON_SOCKET:-${socket_dir}/mixed.sock}"
+churn_daemon_socket="${ORIENT_PERF_GATES_CHURN_DAEMON_SOCKET:-${socket_dir}/churn.sock}"
 
 target/release/orient bench-search \
   --repo . \
@@ -179,8 +182,8 @@ target/release/orient bench-shards \
   "symbol:RouteSymbolManager token"
 
 cold_daemon_log="${tmpdir}/orient-daemon-cold.log"
-target/release/orient serve-tcp \
-  --addr "${cold_daemon_addr}" \
+target/release/orient serve-unix \
+  --socket "${cold_daemon_socket}" \
   --index-dir "${route_shard_dir}" \
   --max-cached-indexes 2 \
   >"${cold_daemon_log}" 2>&1 &
@@ -188,8 +191,9 @@ daemon_pid="$!"
 
 cold_ready=0
 for _ in $(seq 1 60); do
-  if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
-    | target/release/orient client-jsonl --addr "${cold_daemon_addr}" --require-version >/dev/null 2>&1; then
+  if status_output="$(printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+    | target/release/orient client-jsonl --socket "${cold_daemon_socket}" --require-version 2>/dev/null)" \
+    && grep -q "\"process_id\":${daemon_pid}" <<<"${status_output}"; then
     cold_ready=1
     break
   fi
@@ -201,7 +205,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if [[ "${cold_ready}" != "1" ]]; then
-  echo "daemon did not become ready for cold contention gate at ${cold_daemon_addr}" >&2
+  echo "daemon did not become ready for cold contention gate at ${cold_daemon_socket}" >&2
   cat "${cold_daemon_log}" >&2 || true
   exit 1
 fi
@@ -211,7 +215,7 @@ for index in $(seq 0 7); do
   cold_cwds+=(--cwd "${route_workspace}/route-repo-${index}")
 done
 target/release/orient bench-daemon-contend \
-  --addr "${cold_daemon_addr}" \
+  --socket "${cold_daemon_socket}" \
   "${cold_cwds[@]}" \
   --clients 8 \
   --runs 3 \
@@ -230,8 +234,8 @@ wait "${daemon_pid}" 2>/dev/null || true
 daemon_pid=""
 
 mixed_daemon_log="${tmpdir}/orient-daemon-mixed.log"
-target/release/orient serve-tcp \
-  --addr "${mixed_daemon_addr}" \
+target/release/orient serve-unix \
+  --socket "${mixed_daemon_socket}" \
   --index-dir "${route_shard_dir}" \
   --warm-repo "${route_workspace}/route-repo-0" \
   --warm-repo "${route_workspace}/route-repo-42" \
@@ -242,8 +246,9 @@ daemon_pid="$!"
 
 mixed_ready=0
 for _ in $(seq 1 60); do
-  if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
-    | target/release/orient client-jsonl --addr "${mixed_daemon_addr}" --require-version >/dev/null 2>&1; then
+  if status_output="$(printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+    | target/release/orient client-jsonl --socket "${mixed_daemon_socket}" --require-version 2>/dev/null)" \
+    && grep -q "\"process_id\":${daemon_pid}" <<<"${status_output}"; then
     mixed_ready=1
     break
   fi
@@ -255,7 +260,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if [[ "${mixed_ready}" != "1" ]]; then
-  echo "daemon did not become ready for mixed contention gate at ${mixed_daemon_addr}" >&2
+  echo "daemon did not become ready for mixed contention gate at ${mixed_daemon_socket}" >&2
   cat "${mixed_daemon_log}" >&2 || true
   exit 1
 fi
@@ -270,7 +275,7 @@ for _ in $(seq 1 8); do
   mixed_ranges+=(--range "src/lib.rs:1:4")
 done
 target/release/orient bench-daemon-contend \
-  --addr "${mixed_daemon_addr}" \
+  --socket "${mixed_daemon_socket}" \
   "${mixed_cwds[@]}" \
   --clients 10 \
   --runs 8 \
@@ -304,10 +309,9 @@ target/release/orient ensure-shards \
   --repo "${churn_repo}" \
   --output-dir "${churn_shard_dir}"
 
-daemon_addr="${ORIENT_PERF_GATES_DAEMON_ADDR:-127.0.0.1:8795}"
 daemon_log="${tmpdir}/orient-daemon-churn.log"
-target/release/orient serve-tcp \
-  --addr "${daemon_addr}" \
+target/release/orient serve-unix \
+  --socket "${churn_daemon_socket}" \
   --index-dir "${churn_shard_dir}" \
   --warm-repo "${churn_repo}" \
   --max-cached-indexes 2 \
@@ -316,8 +320,9 @@ daemon_pid="$!"
 
 daemon_ready=0
 for _ in $(seq 1 60); do
-  if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
-    | target/release/orient client-jsonl --addr "${daemon_addr}" --require-version >/dev/null 2>&1; then
+  if status_output="$(printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+    | target/release/orient client-jsonl --socket "${churn_daemon_socket}" --require-version 2>/dev/null)" \
+    && grep -q "\"process_id\":${daemon_pid}" <<<"${status_output}"; then
     daemon_ready=1
     break
   fi
@@ -329,13 +334,13 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if [[ "${daemon_ready}" != "1" ]]; then
-  echo "daemon did not become ready for churn gate at ${daemon_addr}" >&2
+  echo "daemon did not become ready for churn gate at ${churn_daemon_socket}" >&2
   cat "${daemon_log}" >&2 || true
   exit 1
 fi
 
 target/release/orient bench-daemon-churn \
-  --addr "${daemon_addr}" \
+  --socket "${churn_daemon_socket}" \
   --cwd "${churn_repo}" \
   --concurrency 4 \
   --runs 5 \

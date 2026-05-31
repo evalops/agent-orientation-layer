@@ -95,7 +95,9 @@ tools/ci/orient_daemon_contention_perf.sh
 Use `ORIENT_DAEMON_CONTEND_MODE=cold` to measure first-touch behavior, `warm`
 to measure pinned active repos, or `both` to run the pair. Query and range files
 can be supplied with `ORIENT_DAEMON_CONTEND_QUERY_FILE` and
-`ORIENT_DAEMON_CONTEND_RANGE_FILE`. Daemon benchmark summaries include
+`ORIENT_DAEMON_CONTEND_RANGE_FILE`. The script starts its owned daemon on a
+per-run Unix socket by default; set `ORIENT_DAEMON_CONTEND_ADDR` only when a TCP
+target is needed. Daemon benchmark summaries include
 `daemon_rss_start_bytes`, `daemon_rss_end_bytes`, and `daemon_rss_max_bytes`
 when the connected daemon exposes process RSS in `daemon_status`.
 

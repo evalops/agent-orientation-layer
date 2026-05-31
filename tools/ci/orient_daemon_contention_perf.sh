@@ -14,7 +14,8 @@ cd "${BUILD_WORKSPACE_DIRECTORY:-$(pwd)}"
 
 root="${ORIENT_DAEMON_CONTEND_ROOT:-${user_home}/Documents/Projects}"
 output_dir="${ORIENT_DAEMON_CONTEND_OUTPUT_DIR:-/tmp/orient-daemon-contend-shards}"
-addr="${ORIENT_DAEMON_CONTEND_ADDR:-127.0.0.1:8797}"
+addr="${ORIENT_DAEMON_CONTEND_ADDR:-}"
+socket="${ORIENT_DAEMON_CONTEND_SOCKET:-}"
 family_limit="${ORIENT_DAEMON_CONTEND_FAMILY_LIMIT:-2}"
 clients="${ORIENT_DAEMON_CONTEND_CLIENTS:-10}"
 runs="${ORIENT_DAEMON_CONTEND_RUNS:-20}"
@@ -148,19 +149,42 @@ run_case() {
 
   local daemon_log
   daemon_log="$(mktemp "${TMPDIR:-/tmp}/orient-daemon-contend.XXXXXX")"
+  local daemon_socket_dir=""
+  local daemon_socket="${socket}"
+  if [[ -z "${addr}" && -z "${daemon_socket}" ]]; then
+    daemon_socket_dir="$(mktemp -d "/tmp/orient-contend-sock.XXXXXX")"
+    daemon_socket="${daemon_socket_dir}/${label}.sock"
+  fi
+  local target_label
+  local serve_command=()
+  local target_args=()
+  if [[ -n "${daemon_socket}" ]]; then
+    target_label="${daemon_socket}"
+    serve_command=(target/release/orient serve-unix --socket "${daemon_socket}")
+    target_args=(--socket "${daemon_socket}")
+  else
+    target_label="${addr}"
+    serve_command=(target/release/orient serve-tcp --addr "${addr}")
+    target_args=(--addr "${addr}")
+  fi
   local daemon_pid=""
   cleanup_case() {
     if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
       kill "${daemon_pid}" 2>/dev/null || true
       wait "${daemon_pid}" 2>/dev/null || true
     fi
+    if [[ -n "${daemon_socket}" ]]; then
+      rm -f "${daemon_socket}" 2>/dev/null || true
+    fi
+    if [[ -n "${daemon_socket_dir}" ]]; then
+      rm -rf "${daemon_socket_dir}" 2>/dev/null || true
+    fi
     rm -f "${daemon_log}"
   }
   trap cleanup_case RETURN
 
-  echo "daemon contention serve (${label}): addr=${addr} index_dir=${output_dir} cwds=${cwds[*]}" >&2
-  target/release/orient serve-tcp \
-    --addr "${addr}" \
+  echo "daemon contention serve (${label}): target=${target_label} index_dir=${output_dir} cwds=${cwds[*]}" >&2
+  "${serve_command[@]}" \
     --index-dir "${output_dir}" \
     --max-cached-indexes "${max_cached_indexes}" \
     "$@" \
@@ -169,8 +193,9 @@ run_case() {
 
   local ready=0
   for _ in $(seq 1 60); do
-    if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
-      | target/release/orient client-jsonl --addr "${addr}" --require-version >/dev/null 2>&1; then
+    if status_output="$(printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+      | target/release/orient client-jsonl "${target_args[@]}" --require-version 2>/dev/null)" \
+      && grep -q "\"process_id\":${daemon_pid}" <<<"${status_output}"; then
       ready=1
       break
     fi
@@ -183,14 +208,14 @@ run_case() {
   done
 
   if [[ "${ready}" != "1" ]]; then
-    echo "daemon did not become ready at ${addr}" >&2
+    echo "daemon did not become ready at ${target_label}" >&2
     cat "${daemon_log}" >&2 || true
     exit 1
   fi
 
   echo "daemon contention bench (${label}): clients=${clients} runs=${runs} warmup=${warmup}" >&2
   target/release/orient bench-daemon-contend \
-    --addr "${addr}" \
+    "${target_args[@]}" \
     "${cwd_args[@]}" \
     --clients "${clients}" \
     --runs "${runs}" \
