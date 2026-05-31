@@ -53,6 +53,63 @@ Set `ORIENT_DAEMON_CWD_REBUILD_SHARDS=1` to rebuild shards, or leave it unset
 to reuse an existing shard directory when possible. The default p95 gate is
 300ms and can be changed with `ORIENT_DAEMON_CWD_P95_MS`.
 
+## Shared Daemon Matrix
+
+For agent-heavy local development, benchmark the shared daemon in two modes:
+
+1. cold first touch, where the daemon knows the shard directory but has not
+   loaded hot repos or warmed common queries
+2. warm steady state, where the daemon preloads the active repos and precomputes
+   the queries agents tend to issue first
+
+Start a cold daemon with:
+
+```bash
+orient serve-tcp \
+  --addr 127.0.0.1:8796 \
+  --index-dir /tmp/orient-shards \
+  --max-cached-indexes 64
+```
+
+Then measure several client loops against the active checkouts:
+
+```bash
+orient bench-daemon-contend \
+  --addr 127.0.0.1:8796 \
+  --cwd /path/to/repo-a \
+  --cwd /path/to/repo-b \
+  --clients 10 \
+  --runs 20 \
+  --warmup 0 \
+  --jitter-ms 25 \
+  --request-timeout-ms 30000 \
+  --query "file:package.json" \
+  --query "kind:function search" \
+  --query "path:src auth token" \
+  --range package.json:1:40
+```
+
+Restart the daemon with warm repos and common warm queries:
+
+```bash
+orient serve-tcp \
+  --addr 127.0.0.1:8796 \
+  --index-dir /tmp/orient-shards \
+  --warm-repo /path/to/repo-a \
+  --warm-repo /path/to/repo-b \
+  --warm-query "file:package.json" \
+  --warm-query "kind:function search" \
+  --warm-query "path:src auth token" \
+  --max-cached-indexes 64
+```
+
+Run the same `bench-daemon-contend` command again with `--warmup 5`. The cold
+run should show first-touch cost through `first_wave_p95_ms` and
+`first_wave_max_ms`; the warm run should drive `fallback_rate` to zero and keep
+steady-state p95 in low milliseconds for repo-scoped agent queries. If warm
+latency is good but cold first wave is high, prioritize repo/query prewarming,
+hot-repo pinning, and first-touch coalescing before broad fallback tuning.
+
 For a running shared daemon, check concurrent local-agent search latency with:
 
 ```bash
