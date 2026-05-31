@@ -97,9 +97,14 @@ to measure pinned active repos, or `both` to run the pair. Query and range files
 can be supplied with `ORIENT_DAEMON_CONTEND_QUERY_FILE` and
 `ORIENT_DAEMON_CONTEND_RANGE_FILE`. The script starts its owned daemon on a
 per-run Unix socket by default; set `ORIENT_DAEMON_CONTEND_ADDR` only when a TCP
-target is needed. Daemon benchmark summaries include
+target is needed. When explicit CWDs are supplied, the script builds shards only
+for those repos instead of the whole discovery root. Daemon benchmark summaries include
 `daemon_rss_start_bytes`, `daemon_rss_end_bytes`, and `daemon_rss_max_bytes`
-when the connected daemon exposes process RSS in `daemon_status`.
+when the connected daemon exposes process RSS in `daemon_status`. Add
+`--fail-daemon-rss-mb N` to daemon benchmark commands when memory footprint
+should be a hard gate instead of an observed counter. The shared contention
+script also accepts `ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_MB`; run it directly
+or through Bazel with `bazel run //:ci_daemon_contention_perf`.
 
 ## Shared Daemon Matrix
 
@@ -272,8 +277,8 @@ deterministic jitter between operations. It reports `sample_count` as
 `wall_ms`, `ops_per_sec`, `first_wave_p95_ms`, and `first_wave_max_ms` to the
 summary. Use it when several local agent processes share one daemon and you care
 about contention rather than a single synchronized wave. `--fail-p95-ms`,
-`--fail-p99-ms`, and `--fail-fallback-rate` make the report usable as a local or
-CI gate.
+`--fail-p99-ms`, `--fail-fallback-rate`, and `--fail-daemon-rss-mb` make the
+report usable as a local or CI gate.
 
 For cold-start behavior, start a fresh daemon and run the same command with
 `--warmup 0`. The first-wave fields then show the initial concurrent touch cost.

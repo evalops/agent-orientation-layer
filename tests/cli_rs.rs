@@ -491,6 +491,13 @@ fn cli_help_shows_default_daemon_addr_for_agent_clients() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ServeMcp").not());
+
+    let mut contend = Command::cargo_bin("orient").unwrap();
+    contend
+        .args(["bench-daemon-contend", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--fail-daemon-rss-mb"));
 }
 
 #[test]

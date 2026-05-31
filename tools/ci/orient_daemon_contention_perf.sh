@@ -30,6 +30,7 @@ mode="${ORIENT_DAEMON_CONTEND_MODE:-warm}"
 p95_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P95_MS:-}"
 p99_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P99_MS:-}"
 fallback_rate_threshold="${ORIENT_DAEMON_CONTEND_FAIL_FALLBACK_RATE:-}"
+daemon_rss_threshold_mb="${ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_MB:-}"
 
 if [[ ! -d "${root}" ]]; then
   if [[ "${ORIENT_DAEMON_CONTEND_REQUIRE_ROOT:-0}" == "1" ]]; then
@@ -53,7 +54,7 @@ else
 fi
 
 if [[ "${#cwds[@]}" -eq 0 ]]; then
-  while IFS= read -r git_dir && [[ "${#cwds[@]}" -lt 2 ]]; do
+  while IFS= read -r git_dir && [[ "${#cwds[@]}" -lt "${family_limit}" ]]; do
     cwds+=("$(dirname "${git_dir}")")
   done < <(
     find "${root}" \
@@ -74,6 +75,11 @@ for cwd in "${cwds[@]}"; do
     echo "daemon contention cwd does not exist: ${cwd}" >&2
     exit 1
   fi
+done
+
+shard_source_args=()
+for cwd in "${cwds[@]}"; do
+  shard_source_args+=(--repo "${cwd}")
 done
 
 queries=()
@@ -122,6 +128,9 @@ fi
 if [[ -n "${fallback_rate_threshold}" ]]; then
   gate_args+=(--fail-fallback-rate "${fallback_rate_threshold}")
 fi
+if [[ -n "${daemon_rss_threshold_mb}" ]]; then
+  gate_args+=(--fail-daemon-rss-mb "${daemon_rss_threshold_mb}")
+fi
 
 cwd_args=()
 warm_repo_args=()
@@ -134,13 +143,10 @@ cargo build --release
 
 if [[ "${ORIENT_DAEMON_CONTEND_REBUILD_SHARDS:-0}" == "1" || ! -f "${output_dir}/manifest.json" ]]; then
   rm -rf "${output_dir}"
-  echo "daemon contention shard build: root=${root} output_dir=${output_dir} family_limit=${family_limit}" >&2
+  echo "daemon contention shard build: output_dir=${output_dir} cwds=${cwds[*]}" >&2
   target/release/orient ensure-shards \
-    --discover-root "${root}" \
-    --output-dir "${output_dir}" \
-    --family-limit "${family_limit}" \
-    --max-depth "${max_depth}" \
-    --discover-limit "${discover_limit}"
+    "${shard_source_args[@]}" \
+    --output-dir "${output_dir}"
 fi
 
 run_case() {

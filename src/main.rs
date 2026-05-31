@@ -987,6 +987,8 @@ enum Commands {
         #[arg(long)]
         fail_p99_ms: Option<f64>,
         #[arg(long)]
+        fail_daemon_rss_mb: Option<f64>,
+        #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
         write_baseline: Option<PathBuf>,
@@ -1027,6 +1029,8 @@ enum Commands {
         #[arg(long)]
         fail_p99_ms: Option<f64>,
         #[arg(long)]
+        fail_daemon_rss_mb: Option<f64>,
+        #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
         write_baseline: Option<PathBuf>,
@@ -1065,6 +1069,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_p99_ms: Option<f64>,
+        #[arg(long)]
+        fail_daemon_rss_mb: Option<f64>,
         #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
@@ -1118,6 +1124,8 @@ enum Commands {
         fail_fallback_rate: Option<f64>,
         #[arg(long)]
         fail_refresh_overhead_ms: Option<f64>,
+        #[arg(long)]
+        fail_daemon_rss_mb: Option<f64>,
     },
     BenchDaemonContend {
         #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
@@ -1157,6 +1165,8 @@ enum Commands {
         fail_fallback_rate: Option<f64>,
         #[arg(long)]
         fail_first_wave_p95_ms: Option<f64>,
+        #[arg(long)]
+        fail_daemon_rss_mb: Option<f64>,
     },
     ToolManifest {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
@@ -6150,6 +6160,7 @@ fn run() -> Result<()> {
             filters,
             fail_p95_ms,
             fail_p99_ms,
+            fail_daemon_rss_mb,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6182,6 +6193,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_daemon_rss_mb {
+                fail_bench_daemon_rss_mb(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonRead {
             socket,
@@ -6195,6 +6209,7 @@ fn run() -> Result<()> {
             ranges,
             fail_p95_ms,
             fail_p99_ms,
+            fail_daemon_rss_mb,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6222,6 +6237,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_daemon_rss_mb {
+                fail_bench_daemon_rss_mb(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonMix {
             socket,
@@ -6238,6 +6256,7 @@ fn run() -> Result<()> {
             range_args,
             fail_p95_ms,
             fail_p99_ms,
+            fail_daemon_rss_mb,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6268,6 +6287,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_daemon_rss_mb {
+                fail_bench_daemon_rss_mb(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonChurn {
             socket,
@@ -6291,6 +6313,7 @@ fn run() -> Result<()> {
             fail_p99_ms,
             fail_fallback_rate,
             fail_refresh_overhead_ms,
+            fail_daemon_rss_mb,
         } => {
             let filters = search_filters_from_args(&filters, repo_filter)?;
             let operations = cli_benchmark_churn_operations(query_args, range_args)?;
@@ -6323,6 +6346,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_refresh_overhead_ms {
                 fail_bench_refresh_overhead(&report, threshold)?;
             }
+            if let Some(threshold) = fail_daemon_rss_mb {
+                fail_bench_daemon_rss_mb(&report, threshold)?;
+            }
         }
         Commands::BenchDaemonContend {
             socket,
@@ -6342,6 +6368,7 @@ fn run() -> Result<()> {
             fail_p99_ms,
             fail_fallback_rate,
             fail_first_wave_p95_ms,
+            fail_daemon_rss_mb,
         } => {
             let filters = search_filters_from_args(&filters, repo_filter)?;
             let operations = cli_benchmark_mix_operations(query_args, range_args)?;
@@ -6369,6 +6396,9 @@ fn run() -> Result<()> {
             }
             if let Some(threshold) = fail_first_wave_p95_ms {
                 fail_bench_first_wave_p95(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_daemon_rss_mb {
+                fail_bench_daemon_rss_mb(&report, threshold)?;
             }
         }
         Commands::ToolManifest { format: _format } => {
@@ -10260,6 +10290,24 @@ fn fail_bench_first_wave_p95(report: &BenchReport, threshold: f64) -> Result<()>
             "first-wave p95 {:.3}ms exceeded threshold {:.3}ms",
             first_wave_p95,
             threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_bench_daemon_rss_mb(report: &BenchReport, threshold_mb: f64) -> Result<()> {
+    let Some(max_rss_bytes) = report.summary.daemon_rss_max_bytes else {
+        bail!(
+            "daemon RSS is unavailable for benchmark mode {:?}; connect to a daemon that exposes process_rss_bytes",
+            report.mode
+        );
+    };
+    let max_rss_mb = max_rss_bytes as f64 / (1024.0 * 1024.0);
+    if max_rss_mb > threshold_mb {
+        bail!(
+            "daemon RSS {:.3}MiB exceeded threshold {:.3}MiB",
+            max_rss_mb,
+            threshold_mb
         );
     }
     Ok(())
