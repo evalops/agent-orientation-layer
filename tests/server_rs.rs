@@ -12166,6 +12166,76 @@ fn tcp_daemon_read_bench_reports_concurrent_range_latency() {
 }
 
 #[test]
+fn tcp_daemon_mix_bench_reports_concurrent_search_and_read_latency() {
+    let binary = assert_cmd::cargo::cargo_bin("orient");
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    write(
+        &repo.path().join("src/auth.rs"),
+        "pub fn issue_token() -> &'static str { \"token\" }\n",
+    );
+
+    let mut child = Command::new(&binary)
+        .args(["serve-tcp", "--addr", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut startup_reader = BufReader::new(stdout);
+    let mut startup = String::new();
+    startup_reader.read_line(&mut startup).unwrap();
+    let startup_json: serde_json::Value = serde_json::from_str(&startup).unwrap();
+    let addr = startup_json["addr"].as_str().unwrap();
+
+    let output = Command::new(&binary)
+        .args([
+            "bench-daemon-mix",
+            "--addr",
+            addr,
+            "--cwd",
+            repo.path().to_str().unwrap(),
+            "--concurrency",
+            "4",
+            "--runs",
+            "2",
+            "--warmup",
+            "1",
+            "--request-timeout-ms",
+            "5000",
+            "--query",
+            "issue token",
+            "--range",
+            "src/auth.rs:1:1",
+        ])
+        .output()
+        .unwrap();
+
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], serde_json::json!("daemon_mix"));
+    assert_eq!(report["concurrency"], serde_json::json!(4));
+    assert_eq!(report["summary"]["query_count"], serde_json::json!(2));
+    assert_eq!(report["summary"]["sample_count"], serde_json::json!(8));
+    let labels = report["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|query| query["query"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"search:issue token"), "{report}");
+    assert!(labels.contains(&"read:src/auth.rs:1:1"), "{report}");
+}
+
+#[test]
 fn tcp_daemon_status_cli_reports_runtime_cache() {
     let binary = assert_cmd::cargo::cargo_bin("orient");
     let mut child = Command::new(&binary)

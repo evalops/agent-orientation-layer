@@ -13,6 +13,8 @@ Orient has four benchmark layers:
   multi-agent setup can check queueing and tail latency.
 - `orient bench-daemon-read` checks the follow-up path after search by sending
   concurrent bounded `read_range` requests to the daemon.
+- `orient bench-daemon-mix` checks the real agent loop by mixing concurrent
+  `search_auto` and `read_range` requests in the same wave.
 - `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
   warms shards, scopes requests through a checkout `cwd`, and gates repeated
   concurrent `search_auto` latency for the path coding agents normally use.
@@ -84,6 +86,25 @@ orient bench-daemon-read \
 
 For `bench-daemon-read`, each reported query is a range label and
 `result_count` is the line count returned by `read_range`.
+
+Check the mixed search/read path with:
+
+```bash
+orient bench-daemon-mix \
+  --addr 127.0.0.1:8796 \
+  --cwd /path/to/current/repo \
+  --concurrency 10 \
+  --runs 10 \
+  --warmup 2 \
+  --request-timeout-ms 30000 \
+  --query "symbol:SessionManager token" \
+  --query "file:Cargo.toml" \
+  --range src/main.rs:1:40 \
+  --range README.md:1:40
+```
+
+For `bench-daemon-mix`, labels are prefixed with `search:` or `read:` so the
+same report shows both sides of the agent search-to-read handoff.
 
 The default query set intentionally mixes:
 

@@ -34,6 +34,7 @@ use orient::shards::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -991,6 +992,43 @@ enum Commands {
             value_name = "PATH:START:LINES[:SCOPE]"
         )]
         ranges: Vec<CliRangeSpec>,
+        #[arg(long)]
+        fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.25)]
+        max_p95_regression: f64,
+    },
+    BenchDaemonMix {
+        #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
+        socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "TCP daemon address; falls back to ORIENT_ADDR or 127.0.0.1:8796"
+        )]
+        addr: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 10)]
+        runs: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS)]
+        request_timeout_ms: u64,
+        #[arg(long = "repo-filter")]
+        repo_filter: Option<String>,
+        #[command(flatten)]
+        filters: CommonSearchArgs,
+        #[arg(long = "query", value_name = "QUERY")]
+        query_args: Vec<String>,
+        #[arg(long = "range", value_name = "PATH:START:LINES[:SCOPE]")]
+        range_args: Vec<CliRangeSpec>,
         #[arg(long)]
         fail_p95_ms: Option<f64>,
         #[arg(long)]
@@ -5866,6 +5904,48 @@ fn run() -> Result<()> {
                 fail_slow_bench_queries(&report, threshold)?;
             }
         }
+        Commands::BenchDaemonMix {
+            socket,
+            addr,
+            cwd,
+            concurrency,
+            runs,
+            warmup,
+            limit,
+            request_timeout_ms,
+            repo_filter,
+            filters,
+            query_args,
+            range_args,
+            fail_p95_ms,
+            baseline,
+            write_baseline,
+            max_p95_regression,
+        } => {
+            let filters = search_filters_from_args(&filters, repo_filter)?;
+            let operations = cli_benchmark_mix_operations(query_args, range_args)?;
+            let report = bench_daemon_mix(DaemonMixBenchConfig {
+                target: resolve_daemon_target(socket, addr),
+                cwd,
+                concurrency,
+                runs,
+                warmup,
+                limit,
+                request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
+                filters,
+                operations,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            if let Some(path) = write_baseline {
+                write_bench_baseline(&path, &report)?;
+            }
+            if let Some(path) = baseline {
+                compare_bench_baseline(&path, &report, max_p95_regression, false, false)?;
+            }
+            if let Some(threshold) = fail_p95_ms {
+                fail_slow_bench_queries(&report, threshold)?;
+            }
+        }
         Commands::ToolManifest { format: _format } => {
             println!("{}", serde_json::to_string(&tool_manifest())?);
         }
@@ -7548,6 +7628,42 @@ fn cli_benchmark_ranges(
     Ok(ranges)
 }
 
+fn cli_benchmark_mix_operations(
+    query_args: Vec<String>,
+    range_args: Vec<CliRangeSpec>,
+) -> Result<Vec<DaemonMixOperation>> {
+    let queries = query_args
+        .into_iter()
+        .filter(|query| !query.is_empty())
+        .collect::<Vec<_>>();
+    if queries.len() > MAX_BATCH_QUERIES {
+        bail!(
+            "queries has {} items, max {}",
+            queries.len(),
+            MAX_BATCH_QUERIES
+        );
+    }
+    if range_args.len() > MAX_BATCH_RANGES {
+        bail!(
+            "ranges has {} items, max {}",
+            range_args.len(),
+            MAX_BATCH_RANGES
+        );
+    }
+    for range in &range_args {
+        validate_cli_range_spec(range)?;
+    }
+    let operations = queries
+        .into_iter()
+        .map(DaemonMixOperation::Search)
+        .chain(range_args.into_iter().map(DaemonMixOperation::Read))
+        .collect::<Vec<_>>();
+    if operations.is_empty() {
+        bail!("provide at least one --query QUERY or --range PATH:START:LINES");
+    }
+    Ok(operations)
+}
+
 fn cli_range_label(range: &CliRangeSpec) -> String {
     match range.scope {
         Some(scope) => format!(
@@ -7715,6 +7831,24 @@ struct DaemonReadBenchConfig {
     warmup: usize,
     request_timeout: Duration,
     ranges: Vec<CliRangeSpec>,
+}
+
+struct DaemonMixBenchConfig {
+    target: DaemonTarget,
+    cwd: Option<PathBuf>,
+    concurrency: usize,
+    runs: usize,
+    warmup: usize,
+    limit: usize,
+    request_timeout: Duration,
+    filters: SearchFilters,
+    operations: Vec<DaemonMixOperation>,
+}
+
+#[derive(Debug, Clone)]
+enum DaemonMixOperation {
+    Search(String),
+    Read(CliRangeSpec),
 }
 
 fn bench_search(config: BenchConfig) -> Result<BenchReport> {
@@ -7932,6 +8066,69 @@ fn bench_daemon_read(config: DaemonReadBenchConfig) -> Result<BenchReport> {
     ))
 }
 
+fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
+    let runs = config.runs.max(1);
+    let concurrency = config.concurrency.max(1);
+    let scheduled_samples = runs * concurrency;
+    if scheduled_samples < config.operations.len() {
+        bail!(
+            "runs * concurrency yields {} samples but {} operations were provided; increase --runs or --concurrency",
+            scheduled_samples,
+            config.operations.len()
+        );
+    }
+    let mut samples_by_operation = BTreeMap::<String, (usize, Vec<f64>)>::new();
+
+    for warmup_index in 0..config.warmup {
+        let _ = run_daemon_mix_wave(
+            &config.target,
+            config.cwd.as_deref(),
+            &config.operations,
+            warmup_index * concurrency,
+            config.limit,
+            &config.filters,
+            concurrency,
+            config.request_timeout,
+        )?;
+    }
+
+    for run_index in 0..runs {
+        let wave = run_daemon_mix_wave(
+            &config.target,
+            config.cwd.as_deref(),
+            &config.operations,
+            run_index * concurrency,
+            config.limit,
+            &config.filters,
+            concurrency,
+            config.request_timeout,
+        )?;
+        for sample in wave {
+            let entry = samples_by_operation
+                .entry(sample.label)
+                .or_insert_with(|| (0, Vec::new()));
+            entry.0 = sample.result_count;
+            entry.1.push(sample.elapsed_ms);
+        }
+    }
+
+    let query_reports = samples_by_operation
+        .into_iter()
+        .map(|(label, (result_count, samples_ms))| {
+            summarize_query(&label, result_count, samples_ms, None, None)
+        })
+        .collect();
+
+    Ok(bench_report(
+        "daemon_mix".to_string(),
+        runs,
+        config.warmup,
+        config.limit,
+        Some(concurrency),
+        query_reports,
+    ))
+}
+
 fn bench_report(
     mode: String,
     runs: usize,
@@ -7952,6 +8149,12 @@ fn bench_report(
 }
 
 struct DaemonBenchSample {
+    result_count: usize,
+    elapsed_ms: f64,
+}
+
+struct DaemonMixBenchSample {
+    label: String,
     result_count: usize,
     elapsed_ms: f64,
 }
@@ -8036,6 +8239,72 @@ fn run_daemon_read_wave(
     Ok(samples)
 }
 
+fn run_daemon_mix_wave(
+    target: &DaemonTarget,
+    cwd: Option<&Path>,
+    operations: &[DaemonMixOperation],
+    operation_offset: usize,
+    limit: usize,
+    filters: &SearchFilters,
+    concurrency: usize,
+    request_timeout: Duration,
+) -> Result<Vec<DaemonMixBenchSample>> {
+    if operations.is_empty() {
+        bail!("daemon mix benchmark needs at least one operation");
+    }
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut handles = Vec::with_capacity(concurrency);
+    for worker_index in 0..concurrency {
+        let target = target.clone();
+        let cwd = cwd.map(Path::to_path_buf);
+        let operation = operations[(operation_offset + worker_index) % operations.len()].clone();
+        let filters = filters.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<DaemonMixBenchSample> {
+            barrier.wait();
+            let started = Instant::now();
+            let (label, result_count) = match operation {
+                DaemonMixOperation::Search(query) => {
+                    let result = run_daemon_search_once(
+                        &target,
+                        cwd.as_deref(),
+                        &query,
+                        limit,
+                        &filters,
+                        request_timeout,
+                    )?;
+                    (
+                        daemon_mix_search_label(&query),
+                        daemon_search_result_count(&result),
+                    )
+                }
+                DaemonMixOperation::Read(range) => {
+                    let result =
+                        run_daemon_read_once(&target, cwd.as_deref(), &range, request_timeout)?;
+                    (
+                        daemon_mix_read_label(&range),
+                        daemon_read_line_count(&result),
+                    )
+                }
+            };
+            Ok(DaemonMixBenchSample {
+                label,
+                result_count,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+            })
+        }));
+    }
+
+    let mut samples = Vec::with_capacity(concurrency);
+    for handle in handles {
+        let sample = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("daemon mix benchmark worker panicked"))??;
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
 fn run_daemon_search_once(
     target: &DaemonTarget,
     cwd: Option<&Path>,
@@ -8114,6 +8383,14 @@ fn daemon_search_result_count(result: &Value) -> usize {
         })
         .or_else(|| result.as_array().map(Vec::len))
         .unwrap_or(0)
+}
+
+fn daemon_mix_search_label(query: &str) -> String {
+    format!("search:{query}")
+}
+
+fn daemon_mix_read_label(range: &CliRangeSpec) -> String {
+    format!("read:{}", cli_range_label(range))
 }
 
 fn daemon_read_line_count(result: &Value) -> usize {
