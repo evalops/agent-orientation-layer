@@ -288,8 +288,25 @@ fn search_batch_result(
     read_batch_request: Option<ResultToolRequest>,
     results: Vec<SearchResult>,
 ) -> SearchBatchResult {
+    search_batch_result_with_summary(
+        query,
+        query_plan_request,
+        repo_map_request,
+        read_batch_request,
+        search_result_summary(&results),
+        results,
+    )
+}
+
+fn search_batch_result_with_summary(
+    query: String,
+    query_plan_request: ResultToolRequest,
+    repo_map_request: ResultToolRequest,
+    read_batch_request: Option<ResultToolRequest>,
+    summary: SearchResultSummary,
+    results: Vec<SearchResult>,
+) -> SearchBatchResult {
     let next_action = search_batch_next_action(&read_batch_request, &query_plan_request);
-    let summary = search_result_summary(&results);
     SearchBatchResult {
         query,
         summary,
@@ -4704,11 +4721,15 @@ impl ToolRuntime {
                             &query,
                             Some(&shard_scope_filters),
                         );
-                        batch.push(search_batch_result(
+                        let shard_route = shard_query_route_stats(&index_dir, &query, &filters)?;
+                        let summary =
+                            search_result_summary_with_shard_route(&results, &None, shard_route);
+                        batch.push(search_batch_result_with_summary(
                             query,
                             query_plan_request,
                             repo_map_request,
                             read_batch_request,
+                            summary,
                             results,
                         ));
                     }
@@ -4826,11 +4847,18 @@ impl ToolRuntime {
                                 query,
                                 Some(&shard_scope_filters),
                             );
-                            batch.push(search_batch_result(
+                            let shard_route = shard_query_route_stats(&index_dir, query, &filters)?;
+                            let summary = search_result_summary_with_shard_route(
+                                &results,
+                                &None,
+                                shard_route,
+                            );
+                            batch.push(search_batch_result_with_summary(
                                 query.clone(),
                                 query_plan_request,
                                 repo_map_request,
                                 read_batch_request,
+                                summary,
                                 results,
                             ));
                         }
@@ -5563,11 +5591,15 @@ impl ToolRuntime {
                         &query,
                         Some(&shard_scope_filters),
                     );
-                    batch.push(search_batch_result(
+                    let shard_route = shard_query_route_stats(&index_dir, &query, &filters)?;
+                    let summary =
+                        search_result_summary_with_shard_route(&results, &None, shard_route);
+                    batch.push(search_batch_result_with_summary(
                         query,
                         query_plan_request,
                         repo_map_request,
                         read_batch_request,
+                        summary,
                         results,
                     ));
                 }

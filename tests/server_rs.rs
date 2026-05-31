@@ -9127,6 +9127,22 @@ fn runtime_search_shards_batch_refreshes_selected_shards_without_unselected_shar
         batch[0]["repo_map_request"]["arguments"]["index_dir"],
         serde_json::json!(&shard_dir)
     );
+    assert_eq!(
+        batch[0]["summary"]["shard_route"]["status"],
+        serde_json::json!("routed")
+    );
+    assert_eq!(
+        batch[0]["summary"]["shard_route"]["total_shards"],
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        batch[0]["summary"]["shard_route"]["selected_shards"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        batch[1]["summary"]["shard_route"]["selected_shards"],
+        serde_json::json!(1)
+    );
     let first_batch_item = serde_json::to_string(&batch[0]).unwrap();
     assert!(
         first_batch_item.contains("current-app/src/new_current.rs"),
@@ -9388,6 +9404,24 @@ fn runtime_orientation_tools_scope_warmed_shards_to_client_cwd() {
     });
     assert!(search_batch.error.is_none(), "{:?}", search_batch.error);
     let search_batch = search_batch.result.unwrap();
+    assert_eq!(
+        search_batch[0]["summary"]["shard_route"]["status"],
+        serde_json::json!("routed_all_shards")
+    );
+    assert_eq!(
+        search_batch[0]["summary"]["shard_route"]["total_shards"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        search_batch[0]["summary"]["shard_route"]["selected_shards"],
+        serde_json::json!(2)
+    );
+    assert!(
+        search_batch[1]["summary"]["shard_route"]["selected_shards"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
     let first_search_batch_item = serde_json::to_string(&search_batch[0]).unwrap();
     assert!(
         first_search_batch_item.contains("current-app/src/lib.rs"),
