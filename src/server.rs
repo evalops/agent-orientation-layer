@@ -26,9 +26,10 @@ use crate::shards::{
     configured_max_shard_workers, ensure_shards, filter_repo_map_by_prefix,
     filters_for_shard_scope, load_manifest, refresh_shards, refresh_shards_by_root,
     related_query_without_shard_selectors, resolve_shard_path_from_manifest,
-    shard_prefilter_query_impossible, shard_route_entries, shard_route_selection,
-    shard_search_scopes, shard_selection_miss_plan, shard_sketch_may_diagnose_query,
-    shard_sketch_may_match_query, shard_status, shard_status_by_root,
+    shard_early_result_target, shard_prefilter_query_impossible, shard_route_entries,
+    shard_route_selection, shard_search_scopes, shard_selection_miss_plan,
+    shard_sketch_may_diagnose_query, shard_sketch_may_match_query, shard_status,
+    shard_status_by_root,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::{Context, Result, anyhow};
@@ -40,7 +41,8 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    mpsc,
 };
 use std::thread;
 use std::time::SystemTime;
@@ -1062,6 +1064,12 @@ enum IndexCacheState {
 struct ShardJob {
     shard: ShardEntry,
     scopes: Vec<ShardSearchScope>,
+}
+
+enum CachedShardSearchMessage {
+    Results(Vec<SearchResult>),
+    Error(anyhow::Error),
+    Done,
 }
 
 fn shard_jobs_from_entries(
@@ -7582,21 +7590,59 @@ impl ToolRuntime {
 
         let chunk_size = jobs.len().div_ceil(workers);
         let mut results = Vec::new();
+        let target = shard_early_result_target(limit);
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel::<CachedShardSearchMessage>();
         thread::scope(|scope| {
             let handles = jobs
                 .chunks(chunk_size)
                 .map(|chunk| {
+                    let tx = tx.clone();
+                    let stop = &stop;
                     scope.spawn(move || {
-                        self.search_shard_job_batch_cached(index_dir, query, limit, filters, chunk)
+                        if let Err(error) = self.search_shard_job_batch_cached_stream(
+                            index_dir, query, limit, filters, chunk, stop, &tx,
+                        ) {
+                            stop.store(true, AtomicOrdering::Relaxed);
+                            let _ = tx.send(CachedShardSearchMessage::Error(error));
+                        }
+                        let _ = tx.send(CachedShardSearchMessage::Done);
                     })
                 })
                 .collect::<Vec<_>>();
+            drop(tx);
+
+            let mut done = 0usize;
+            let mut first_error = None;
+            while done < handles.len() {
+                match rx.recv() {
+                    Ok(CachedShardSearchMessage::Results(batch)) => {
+                        results.extend(batch);
+                        if results.len() >= target {
+                            stop.store(true, AtomicOrdering::Relaxed);
+                        }
+                    }
+                    Ok(CachedShardSearchMessage::Error(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        stop.store(true, AtomicOrdering::Relaxed);
+                    }
+                    Ok(CachedShardSearchMessage::Done) => {
+                        done += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
 
             for handle in handles {
-                let batch = handle
+                handle
                     .join()
-                    .map_err(|_| anyhow!("shard search worker panicked"))??;
-                results.extend(batch);
+                    .map_err(|_| anyhow!("shard search worker panicked"))?;
+            }
+
+            if let Some(error) = first_error {
+                return Err(error);
             }
             Ok::<(), anyhow::Error>(())
         })?;
@@ -7760,6 +7806,45 @@ impl ToolRuntime {
             }
         }
         Ok(results)
+    }
+
+    fn search_shard_job_batch_cached_stream(
+        &self,
+        index_dir: &std::path::Path,
+        query: &str,
+        limit: usize,
+        filters: &SearchFilters,
+        jobs: &[ShardJob],
+        stop: &AtomicBool,
+        tx: &mpsc::Sender<CachedShardSearchMessage>,
+    ) -> Result<()> {
+        for job in jobs {
+            if stop.load(AtomicOrdering::Relaxed) {
+                break;
+            }
+            let index = self.cached_index(index_dir.join(&job.shard.index))?;
+            for scope in &job.scopes {
+                if stop.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                let scoped_filters = filters_for_shard_scope(filters, scope.path_prefix.as_deref());
+                let mut batch = Vec::new();
+                for mut result in index.search_filtered(query, limit, &scoped_filters)? {
+                    if let Some(prefix) = &scope.path_prefix {
+                        if !result.path.starts_with(prefix) {
+                            continue;
+                        }
+                    }
+                    prefix_search_result_paths(&mut result, scope);
+                    result.reason = format!("shard:{}; {}", scope.output_prefix, result.reason);
+                    batch.push(result);
+                }
+                if !batch.is_empty() && tx.send(CachedShardSearchMessage::Results(batch)).is_err() {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn read_shard_range_cached(

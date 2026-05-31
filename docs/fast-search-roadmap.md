@@ -38,6 +38,8 @@ JSON-lines/MCP-style calls, and repo-relative examples in public docs.
   filter postings.
 - Incremental single-repo refresh for add, edit, delete, and rename cases.
 - Multi-repo shard directories with one index per repo and a validated manifest.
+- Bounded shard fanout that streams per-shard candidates and stops remaining
+  work after an overfetch budget is satisfied.
 - TCP, Unix-socket, stdio JSON-lines, and MCP-style transports.
 - A shared daemon that can register shard directories, lazily warm touched
   shard indexes, and serve many local agents.
@@ -52,7 +54,8 @@ JSON-lines/MCP-style calls, and repo-relative examples in public docs.
 ## Near-Term Direction
 
 - Keep the no-index `rg` path as the baseline fallback.
-- Keep improving shard fanout so impossible searches avoid cold index loads.
+- Keep improving shard fanout quality so broad searches return fast without
+  over-biasing toward early shards.
 - Make query-plan output shorter and more actionable for agents.
 - Continue moving the persisted format toward sectioned, mmap-friendly blocks.
 - Keep docs focused on local setup, shared daemon operation, and footprint.

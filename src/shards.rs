@@ -18,6 +18,10 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +48,7 @@ const SHARD_ROUTE_SUBSTRING_GRAM_CHARS: usize = 6;
 const SHARD_ROUTE_SHORT_FILTER_MIN_CHARS: usize = 2;
 pub const DEFAULT_MAX_SHARD_WORKERS: usize = 8;
 pub const MAX_SHARD_WORKERS_ENV: &str = "ORIENT_MAX_SHARD_WORKERS";
+const SHARD_SEARCH_EARLY_RESULT_FACTOR: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifest {
@@ -1161,6 +1166,12 @@ struct ShardJob {
     scopes: Vec<ShardSearchScope>,
 }
 
+enum ShardSearchMessage {
+    Results(Vec<SearchResult>),
+    Error(anyhow::Error),
+    Done,
+}
+
 fn search_shard_jobs(
     index_dir: &Path,
     query: &str,
@@ -1179,23 +1190,69 @@ fn search_shard_jobs(
 
     let chunk_size = jobs.len().div_ceil(workers);
     let mut results = Vec::new();
+    let target = shard_early_result_target(limit);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<ShardSearchMessage>();
     thread::scope(|scope| {
         let handles = jobs
             .chunks(chunk_size)
             .map(|chunk| {
-                scope.spawn(move || search_shard_job_batch(index_dir, query, limit, filters, chunk))
+                let tx = tx.clone();
+                let stop = &stop;
+                scope.spawn(move || {
+                    if let Err(error) = search_shard_job_batch_stream(
+                        index_dir, query, limit, filters, chunk, stop, &tx,
+                    ) {
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = tx.send(ShardSearchMessage::Error(error));
+                    }
+                    let _ = tx.send(ShardSearchMessage::Done);
+                })
             })
             .collect::<Vec<_>>();
+        drop(tx);
+
+        let mut done = 0usize;
+        let mut first_error = None;
+        while done < handles.len() {
+            match rx.recv() {
+                Ok(ShardSearchMessage::Results(batch)) => {
+                    results.extend(batch);
+                    if results.len() >= target {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(ShardSearchMessage::Error(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                }
+                Ok(ShardSearchMessage::Done) => {
+                    done += 1;
+                }
+                Err(_) => break,
+            }
+        }
 
         for handle in handles {
-            let batch = handle
+            handle
                 .join()
-                .map_err(|_| anyhow::anyhow!("shard search worker panicked"))??;
-            results.extend(batch);
+                .map_err(|_| anyhow::anyhow!("shard search worker panicked"))?;
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(results)
+}
+
+pub(crate) fn shard_early_result_target(limit: usize) -> usize {
+    limit
+        .saturating_mul(SHARD_SEARCH_EARLY_RESULT_FACTOR)
+        .max(limit)
 }
 
 pub(crate) fn bounded_shard_worker_count(job_count: usize) -> usize {
@@ -1255,6 +1312,45 @@ fn search_shard_job_batch(
         }
     }
     Ok(results)
+}
+
+fn search_shard_job_batch_stream(
+    index_dir: &Path,
+    query: &str,
+    limit: usize,
+    filters: &SearchFilters,
+    jobs: &[ShardJob],
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<ShardSearchMessage>,
+) -> Result<()> {
+    for job in jobs {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let index = FastIndex::load(index_dir.join(&job.shard.index))
+            .with_context(|| format!("load shard {}", job.shard.index))?;
+        for scope in &job.scopes {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let scoped_filters = filters_for_shard_scope(filters, scope.path_prefix.as_deref());
+            let mut batch = Vec::new();
+            for mut result in index.search_filtered(query, limit, &scoped_filters)? {
+                if let Some(prefix) = &scope.path_prefix {
+                    if !result.path.starts_with(prefix) {
+                        continue;
+                    }
+                }
+                prefix_search_result_paths(&mut result, scope);
+                result.reason = format!("shard:{}; {}", scope.output_prefix, result.reason);
+                batch.push(result);
+            }
+            if !batch.is_empty() && tx.send(ShardSearchMessage::Results(batch)).is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn shard_query_plans(
@@ -4717,6 +4813,13 @@ mod tests {
         assert_eq!(bounded_shard_worker_count_for(32, 16, 6), 6);
         assert_eq!(bounded_shard_worker_count_for(32, 0, 8), 1);
         assert_eq!(bounded_shard_worker_count_for(32, 16, 0), 1);
+    }
+
+    #[test]
+    fn shard_early_result_target_overfetches_requested_limit() {
+        assert_eq!(shard_early_result_target(0), 0);
+        assert_eq!(shard_early_result_target(1), 4);
+        assert_eq!(shard_early_result_target(10), 40);
     }
 
     #[test]

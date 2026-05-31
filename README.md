@@ -161,6 +161,10 @@ When an adapter only needs the next move, plan tools also accept `advice:true`
 or `--advice`; that returns status, the suggested query, top hint kinds, and
 ready retry CLI/JSONL strings without full plan payloads.
 
+Shard searches overfetch enough candidates for final ranking, then stop
+remaining shard work once the result budget is satisfied. This keeps broad
+multi-repo searches bounded without changing the top-level `limit` contract.
+
 Batch read follow-ups include `read_budget` so wrappers can split large reads
 before hitting range or line caps. Manual reads accept copied file locations such
 as `src/lib.rs:42-45` and can use `scope:symbol` to anchor at the nearest
