@@ -25,9 +25,10 @@ use orient::server::{
     serve_tcp, tcp_client_command, tool_manifest, unix_client_command,
 };
 use orient::shards::{
-    SHARD_MANIFEST_FORMAT_VERSION, ShardFreshness, ShardQueryPlan, build_shards_with_force,
-    ensure_shards, find_shard_symbol, read_shard_range, read_shard_range_scoped, refresh_shards,
-    related_shard_files_filtered, related_shard_symbols_filtered, search_shards, shard_query_plans,
+    SHARD_MANIFEST_FORMAT_VERSION, ShardFreshness, ShardQueryPlan, ShardRouteStats,
+    build_shards_with_force, ensure_shards, find_shard_symbol, read_shard_range,
+    read_shard_range_scoped, refresh_shards, related_shard_files_filtered,
+    related_shard_symbols_filtered, search_shards, shard_query_plans, shard_query_route_stats,
     shard_repo_maps, shard_status,
 };
 use serde::{Deserialize, Serialize};
@@ -1572,6 +1573,8 @@ struct BenchSummary {
 struct QueryBench {
     query: String,
     result_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shard_route: Option<ShardRouteStats>,
     min_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
@@ -7438,7 +7441,7 @@ fn bench_search(config: BenchConfig) -> Result<BenchReport> {
             samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
             result_count = results.len();
         }
-        query_reports.push(summarize_query(query, result_count, samples_ms));
+        query_reports.push(summarize_query(query, result_count, samples_ms, None));
     }
 
     Ok(bench_report(
@@ -7483,7 +7486,17 @@ fn bench_shards(config: ShardBenchConfig) -> Result<BenchReport> {
             samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
             result_count = results.len();
         }
-        query_reports.push(summarize_query(query, result_count, samples_ms));
+        let shard_route = Some(shard_query_route_stats(
+            &config.index_dir,
+            query,
+            &config.filters,
+        )?);
+        query_reports.push(summarize_query(
+            query,
+            result_count,
+            samples_ms,
+            shard_route,
+        ));
     }
 
     Ok(bench_report(
@@ -7544,7 +7557,12 @@ fn run_search_once(
     }
 }
 
-fn summarize_query(query: &str, result_count: usize, mut samples_ms: Vec<f64>) -> QueryBench {
+fn summarize_query(
+    query: &str,
+    result_count: usize,
+    mut samples_ms: Vec<f64>,
+    shard_route: Option<ShardRouteStats>,
+) -> QueryBench {
     samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let min_ms = *samples_ms.first().unwrap_or(&0.0);
     let max_ms = *samples_ms.last().unwrap_or(&0.0);
@@ -7554,6 +7572,7 @@ fn summarize_query(query: &str, result_count: usize, mut samples_ms: Vec<f64>) -
     QueryBench {
         query: query.to_string(),
         result_count,
+        shard_route,
         min_ms: round_ms(min_ms),
         p50_ms: round_ms(p50_ms),
         p95_ms: round_ms(p95_ms),

@@ -35,6 +35,8 @@ Interpret results in two buckets. Repo-scoped, file-scoped, and language-scoped
 queries should stay in low double-digit milliseconds on warm shards. Broad
 unscoped queries over very large multi-checkout workspaces are expected to expose
 routing and fanout limits; those numbers are planning inputs, not CI gates.
+For shard benchmarks, inspect each query's `shard_route` field. `selected_shards`
+near `total_shards` means the query is paying broad fanout cost before ranking.
 
 Current local baselines show the useful shape:
 

@@ -6238,6 +6238,8 @@ fn cli_reports_search_benchmarks() {
         .success()
         .stdout(predicate::str::contains("\"mode\":\"shards_cached\""))
         .stdout(predicate::str::contains("\"summary\""))
+        .stdout(predicate::str::contains("\"shard_route\""))
+        .stdout(predicate::str::contains("\"selected_shards\""))
         .stdout(predicate::str::contains("\"p95_ms\""))
         .stdout(predicate::str::contains("\"p99_ms\""));
 
@@ -6259,6 +6261,7 @@ fn cli_reports_search_benchmarks() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"mode\":\"shards\""))
+        .stdout(predicate::str::contains("\"shard_route\""))
         .stdout(predicate::str::contains("\"p95_ms\""))
         .stdout(predicate::str::contains("\"p99_ms\""));
 

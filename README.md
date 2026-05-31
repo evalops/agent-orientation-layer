@@ -202,7 +202,8 @@ different local root.
 `bench-search` and `bench-shards` emit per-query samples plus a compact
 `summary` with query count, total samples, max p95/p99, max sample, and the
 slowest query. Use `--fail-p95-ms` for hard gates and `--baseline` /
-`--write-baseline` for regression checks.
+`--write-baseline` for regression checks. `bench-shards` also reports
+`shard_route` so slow queries show their selected shard count.
 
 ## Docs
 

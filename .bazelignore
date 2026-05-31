@@ -1,0 +1,5 @@
+target
+bazel-bin
+bazel-out
+bazel-testlogs
+result

@@ -25,12 +25,12 @@ pub const SHARD_MANIFEST_FORMAT_VERSION: u32 = 1;
 const SHARD_MANIFEST_VERSION: u32 = SHARD_MANIFEST_FORMAT_VERSION;
 const SHARD_MANIFEST_SIDECAR_VERSION: u32 = 2;
 const SHARD_MANIFEST_PREFILTER_VERSION: u32 = 3;
-const SHARD_MANIFEST_ROUTE_VERSION: u32 = 10;
+const SHARD_MANIFEST_ROUTE_VERSION: u32 = 11;
 const SHARD_MANIFEST_FILE: &str = "manifest.json";
 const SHARD_MANIFEST_SIDECAR_FILE: &str = "manifest.bin";
 const SHARD_MANIFEST_PREFILTER_FILE: &str = "manifest.prefilter.bin";
 const SHARD_MANIFEST_ROUTE_FILE: &str = "manifest.route.bin";
-const SHARD_ROUTE_MAX_POSTING_SHARDS: usize = 64;
+const SHARD_ROUTE_MAX_POSTING_SHARDS: usize = 1024;
 const SHARD_WRITE_LOCK_FILE: &str = ".orient-shards.lock";
 const SHARD_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 const SHARD_WRITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -139,6 +139,14 @@ pub(crate) struct ShardRouteSelection {
     pub shards: Vec<ShardEntry>,
     pub shard_count: usize,
     pub shard_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardRouteStats {
+    pub status: String,
+    pub routed: bool,
+    pub total_shards: usize,
+    pub selected_shards: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2718,6 +2726,120 @@ pub(crate) fn shard_route_entries(
     Ok(shard_route_selection(index_dir, shard_query, filters)?.map(|selection| selection.shards))
 }
 
+pub fn shard_query_route_stats(
+    index_dir: impl AsRef<Path>,
+    query: &str,
+    filters: &SearchFilters,
+) -> Result<ShardRouteStats> {
+    let parsed = parse_query(query);
+    let filters = merge_filters(filters.clone(), parsed.filters);
+    let shard_query = query_text(&parsed.terms, &filters);
+    shard_route_stats(index_dir.as_ref(), &shard_query, &filters)
+}
+
+fn shard_route_stats(
+    index_dir: &Path,
+    shard_query: &str,
+    filters: &SearchFilters,
+) -> Result<ShardRouteStats> {
+    let requirements = shard_route_requirements(shard_query, filters);
+    let has_route_requirements = !requirements.exact_hashes.is_empty()
+        || !requirements.trigram_hashes.is_empty()
+        || !requirements.substring_grams.is_empty();
+    if !has_route_requirements && !shard_route_filter_only_selectable(filters) {
+        let total_shards = load_manifest(index_dir)?.shards.len();
+        return Ok(shard_route_stats_value(
+            "no_route_requirements",
+            false,
+            total_shards,
+            total_shards,
+        ));
+    }
+    let Some(route) = load_manifest_route(index_dir)? else {
+        let total_shards = load_manifest(index_dir)?.shards.len();
+        return Ok(shard_route_stats_value(
+            "route_missing",
+            false,
+            total_shards,
+            total_shards,
+        ));
+    };
+    let total_shards = route.shards.len();
+    let candidate_ids = if has_route_requirements {
+        match shard_route_candidate_ids(&route, &requirements) {
+            ShardRouteLookup::Candidates(candidate_ids) => candidate_ids,
+            ShardRouteLookup::MissingHash => {
+                return Ok(shard_route_stats_value(
+                    "missing_hash",
+                    true,
+                    total_shards,
+                    0,
+                ));
+            }
+            ShardRouteLookup::Omitted => {
+                return Ok(shard_route_stats_value(
+                    "route_omitted",
+                    false,
+                    total_shards,
+                    total_shards,
+                ));
+            }
+            ShardRouteLookup::Corrupt => {
+                return Ok(shard_route_stats_value(
+                    "route_corrupt",
+                    false,
+                    total_shards,
+                    total_shards,
+                ));
+            }
+        }
+    } else {
+        (0..route.shards.len())
+            .filter_map(|id| u16::try_from(id).ok())
+            .collect()
+    };
+    let selected_shards = candidate_ids
+        .into_iter()
+        .filter(|id| {
+            route
+                .shards
+                .get(*id as usize)
+                .is_some_and(|shard| shard_route_filters_may_match(shard, filters))
+        })
+        .count();
+    let status = if selected_shards == total_shards {
+        if has_route_requirements {
+            "routed_all_shards"
+        } else {
+            "filter_route_all_shards"
+        }
+    } else if has_route_requirements {
+        "routed"
+    } else {
+        "filter_route"
+    };
+    Ok(shard_route_stats_value(
+        status,
+        true,
+        total_shards,
+        selected_shards,
+    ))
+}
+
+fn shard_route_stats_value(
+    status: &str,
+    routed: bool,
+    total_shards: usize,
+    selected_shards: usize,
+) -> ShardRouteStats {
+    ShardRouteStats {
+        status: status.to_string(),
+        routed,
+        total_shards,
+        selected_shards,
+    }
+}
+
 pub(crate) fn shard_route_selection(
     index_dir: &Path,
     shard_query: &str,
@@ -4136,6 +4258,153 @@ mod tests {
                 &exact_route_requirements(&[broad_hash, narrow_hash])
             ),
             ShardRouteLookup::Candidates(vec![0])
+        );
+    }
+
+    #[test]
+    fn manifest_route_keeps_wide_terms_for_multi_term_intersection() {
+        let dir = tempfile::tempdir().unwrap();
+        let broad_hash = sketch_fingerprint("wideintersectionprobe");
+        let narrow_hash = sketch_fingerprint("narrowintersectionprobe");
+        let shards = (0..65)
+            .map(|index| ShardEntry {
+                name: format!("repo-{index}"),
+                root: dir.path().join(format!("repo-{index}")),
+                index: format!("repo-{index}.orient"),
+                aliases: Vec::new(),
+                git: None,
+                sketch: Some(ShardQuerySketch {
+                    exact_hashes: if index == 42 {
+                        vec![broad_hash, narrow_hash]
+                    } else {
+                        vec![broad_hash]
+                    },
+                    trigram_hashes: Vec::new(),
+                    exact_bits: Vec::new(),
+                    trigram_bits: Vec::new(),
+                    substring_bits: Vec::new(),
+                    symbol_kind_bits: Vec::new(),
+                    filter_bits: Vec::new(),
+                }),
+            })
+            .collect();
+        let manifest = ShardManifest {
+            version: SHARD_MANIFEST_VERSION,
+            shards,
+        };
+        save_manifest(dir.path(), &manifest).unwrap();
+
+        let route = load_manifest_route(dir.path()).unwrap().unwrap();
+        assert!(
+            route.omitted_hashes.binary_search(&broad_hash).is_err(),
+            "terms spread across common workspaces should stay routable"
+        );
+        assert_eq!(
+            shard_route_candidate_ids(&route, &exact_route_requirements(&[broad_hash])),
+            ShardRouteLookup::Candidates((0..65).collect())
+        );
+        assert_eq!(
+            shard_route_candidate_ids(
+                &route,
+                &exact_route_requirements(&[broad_hash, narrow_hash])
+            ),
+            ShardRouteLookup::Candidates(vec![42])
+        );
+
+        let broad_stats = shard_query_route_stats(
+            dir.path(),
+            "wideintersectionprobe",
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            broad_stats,
+            ShardRouteStats {
+                status: "routed_all_shards".to_string(),
+                routed: true,
+                total_shards: 65,
+                selected_shards: 65,
+            }
+        );
+        let narrow_stats = shard_query_route_stats(
+            dir.path(),
+            "wideintersectionprobe narrowintersectionprobe",
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            narrow_stats,
+            ShardRouteStats {
+                status: "routed".to_string(),
+                routed: true,
+                total_shards: 65,
+                selected_shards: 1,
+            }
+        );
+        let missing_stats = shard_query_route_stats(
+            dir.path(),
+            "missingintersectionprobe",
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_stats,
+            ShardRouteStats {
+                status: "missing_hash".to_string(),
+                routed: true,
+                total_shards: 65,
+                selected_shards: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_route_intersects_multiple_wide_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_hash = sketch_fingerprint("leftwideintersectionprobe");
+        let right_hash = sketch_fingerprint("rightwideintersectionprobe");
+        let shards = (0..100)
+            .map(|index| ShardEntry {
+                name: format!("repo-{index}"),
+                root: dir.path().join(format!("repo-{index}")),
+                index: format!("repo-{index}.orient"),
+                aliases: Vec::new(),
+                git: None,
+                sketch: Some(ShardQuerySketch {
+                    exact_hashes: match index {
+                        0..=69 => vec![left_hash],
+                        70..=89 => vec![left_hash, right_hash],
+                        _ => vec![right_hash],
+                    },
+                    trigram_hashes: Vec::new(),
+                    exact_bits: Vec::new(),
+                    trigram_bits: Vec::new(),
+                    substring_bits: Vec::new(),
+                    symbol_kind_bits: Vec::new(),
+                    filter_bits: Vec::new(),
+                }),
+            })
+            .collect();
+        let manifest = ShardManifest {
+            version: SHARD_MANIFEST_VERSION,
+            shards,
+        };
+        save_manifest(dir.path(), &manifest).unwrap();
+
+        let route = load_manifest_route(dir.path()).unwrap().unwrap();
+        assert!(route.omitted_hashes.binary_search(&left_hash).is_err());
+        assert!(route.omitted_hashes.binary_search(&right_hash).is_err());
+        assert_eq!(
+            shard_route_candidate_ids(&route, &exact_route_requirements(&[left_hash])),
+            ShardRouteLookup::Candidates((0..90).collect())
+        );
+        assert_eq!(
+            shard_route_candidate_ids(&route, &exact_route_requirements(&[right_hash])),
+            ShardRouteLookup::Candidates((70..100).collect())
+        );
+        assert_eq!(
+            shard_route_candidate_ids(&route, &exact_route_requirements(&[left_hash, right_hash])),
+            ShardRouteLookup::Candidates((70..90).collect())
         );
     }
 
