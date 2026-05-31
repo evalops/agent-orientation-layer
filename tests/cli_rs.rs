@@ -497,6 +497,7 @@ fn cli_help_shows_default_daemon_addr_for_agent_clients() {
         .args(["bench-daemon-contend", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("--fail-p99-p95-ratio"))
         .stdout(predicate::str::contains("--fail-daemon-rss-mb"))
         .stdout(predicate::str::contains("--fail-daemon-rss-source-ratio"));
 }

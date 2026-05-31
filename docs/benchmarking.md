@@ -108,6 +108,11 @@ contention script also accepts `ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_MB` and
 `ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_SOURCE_RATIO`; run it directly or through
 Bazel with `bazel run //:ci_daemon_contention_perf`.
 
+All query benchmark reports include per-query `p99_p95_ratio` and summary
+`max_p99_p95_ratio`. Add `--fail-p99-p95-ratio N` when the tail spread matters
+more than the absolute p95 or p99 alone; the shared contention script accepts
+`ORIENT_DAEMON_CONTEND_FAIL_P99_P95_RATIO`.
+
 ## Shared Daemon Matrix
 
 For agent-heavy local development, benchmark the shared daemon in two modes:
@@ -279,8 +284,9 @@ deterministic jitter between operations. It reports `sample_count` as
 `wall_ms`, `ops_per_sec`, `first_wave_p95_ms`, and `first_wave_max_ms` to the
 summary. Use it when several local agent processes share one daemon and you care
 about contention rather than a single synchronized wave. `--fail-p95-ms`,
-`--fail-p99-ms`, `--fail-fallback-rate`, `--fail-daemon-rss-mb`, and
-`--fail-daemon-rss-source-ratio` make the report usable as a local or CI gate.
+`--fail-p99-ms`, `--fail-p99-p95-ratio`, `--fail-fallback-rate`,
+`--fail-daemon-rss-mb`, and `--fail-daemon-rss-source-ratio` make the report
+usable as a local or CI gate.
 
 For cold-start behavior, start a fresh daemon and run the same command with
 `--warmup 0`. The first-wave fields then show the initial concurrent touch cost.

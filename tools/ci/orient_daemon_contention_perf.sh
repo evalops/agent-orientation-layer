@@ -29,6 +29,7 @@ discover_limit="${ORIENT_DAEMON_CONTEND_DISCOVER_LIMIT:-500}"
 mode="${ORIENT_DAEMON_CONTEND_MODE:-warm}"
 p95_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P95_MS:-}"
 p99_threshold_ms="${ORIENT_DAEMON_CONTEND_FAIL_P99_MS:-}"
+p99_p95_ratio_threshold="${ORIENT_DAEMON_CONTEND_FAIL_P99_P95_RATIO:-}"
 fallback_rate_threshold="${ORIENT_DAEMON_CONTEND_FAIL_FALLBACK_RATE:-}"
 daemon_rss_threshold_mb="${ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_MB:-}"
 daemon_rss_source_ratio_threshold="${ORIENT_DAEMON_CONTEND_FAIL_DAEMON_RSS_SOURCE_RATIO:-}"
@@ -125,6 +126,9 @@ if [[ -n "${p95_threshold_ms}" ]]; then
 fi
 if [[ -n "${p99_threshold_ms}" ]]; then
   gate_args+=(--fail-p99-ms "${p99_threshold_ms}")
+fi
+if [[ -n "${p99_p95_ratio_threshold}" ]]; then
+  gate_args+=(--fail-p99-p95-ratio "${p99_p95_ratio_threshold}")
 fi
 if [[ -n "${fallback_rate_threshold}" ]]; then
   gate_args+=(--fail-fallback-rate "${fallback_rate_threshold}")

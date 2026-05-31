@@ -912,6 +912,8 @@ enum Commands {
         #[arg(long)]
         fail_p99_ms: Option<f64>,
         #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
+        #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
         allow_baseline_mode_mismatch: bool,
@@ -947,6 +949,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_p99_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
         #[arg(long)]
         baseline: Option<PathBuf>,
         #[arg(long)]
@@ -986,6 +990,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_p99_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
         #[arg(long)]
         fail_daemon_rss_mb: Option<f64>,
         #[arg(long)]
@@ -1031,6 +1037,8 @@ enum Commands {
         #[arg(long)]
         fail_p99_ms: Option<f64>,
         #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
+        #[arg(long)]
         fail_daemon_rss_mb: Option<f64>,
         #[arg(long)]
         fail_daemon_rss_source_ratio: Option<f64>,
@@ -1073,6 +1081,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_p99_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
         #[arg(long)]
         fail_daemon_rss_mb: Option<f64>,
         #[arg(long)]
@@ -1127,6 +1137,8 @@ enum Commands {
         #[arg(long)]
         fail_p99_ms: Option<f64>,
         #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
+        #[arg(long)]
         fail_fallback_rate: Option<f64>,
         #[arg(long)]
         fail_refresh_overhead_ms: Option<f64>,
@@ -1169,6 +1181,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_p99_ms: Option<f64>,
+        #[arg(long)]
+        fail_p99_p95_ratio: Option<f64>,
         #[arg(long)]
         fail_fallback_rate: Option<f64>,
         #[arg(long)]
@@ -1893,6 +1907,7 @@ struct BenchSummary {
     sample_count: usize,
     max_p95_ms: f64,
     max_p99_ms: f64,
+    max_p99_p95_ratio: f64,
     max_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slowest_query: Option<String>,
@@ -1951,6 +1966,8 @@ struct QueryBench {
     p95_ms: f64,
     #[serde(default)]
     p99_ms: f64,
+    #[serde(default)]
+    p99_p95_ratio: f64,
     max_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fallback_count: Option<usize>,
@@ -6079,6 +6096,7 @@ fn run() -> Result<()> {
             filters,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             baseline,
             allow_baseline_mode_mismatch,
             require_faster_than_baseline,
@@ -6118,6 +6136,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
+            }
         }
         Commands::BenchShards {
             index_dir,
@@ -6130,6 +6151,7 @@ fn run() -> Result<()> {
             filters,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             baseline,
             write_baseline,
             max_p95_regression,
@@ -6160,6 +6182,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
+            }
         }
         Commands::BenchDaemon {
             socket,
@@ -6174,6 +6199,7 @@ fn run() -> Result<()> {
             filters,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             fail_daemon_rss_mb,
             fail_daemon_rss_source_ratio,
             baseline,
@@ -6208,6 +6234,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
+            }
             if let Some(threshold) = fail_daemon_rss_mb {
                 fail_bench_daemon_rss_mb(&report, threshold)?;
             }
@@ -6227,6 +6256,7 @@ fn run() -> Result<()> {
             ranges,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             fail_daemon_rss_mb,
             fail_daemon_rss_source_ratio,
             baseline,
@@ -6256,6 +6286,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
+            }
             if let Some(threshold) = fail_daemon_rss_mb {
                 fail_bench_daemon_rss_mb(&report, threshold)?;
             }
@@ -6278,6 +6311,7 @@ fn run() -> Result<()> {
             range_args,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             fail_daemon_rss_mb,
             fail_daemon_rss_source_ratio,
             baseline,
@@ -6310,6 +6344,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
+            }
             if let Some(threshold) = fail_daemon_rss_mb {
                 fail_bench_daemon_rss_mb(&report, threshold)?;
             }
@@ -6337,6 +6374,7 @@ fn run() -> Result<()> {
             keep_churn_files,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             fail_fallback_rate,
             fail_refresh_overhead_ms,
             fail_daemon_rss_mb,
@@ -6367,6 +6405,9 @@ fn run() -> Result<()> {
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
             }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
+            }
             if let Some(threshold) = fail_fallback_rate {
                 fail_bench_fallback_rate(&report, threshold)?;
             }
@@ -6396,6 +6437,7 @@ fn run() -> Result<()> {
             range_args,
             fail_p95_ms,
             fail_p99_ms,
+            fail_p99_p95_ratio,
             fail_fallback_rate,
             fail_first_wave_p95_ms,
             fail_daemon_rss_mb,
@@ -6421,6 +6463,9 @@ fn run() -> Result<()> {
             }
             if let Some(threshold) = fail_p99_ms {
                 fail_bench_p99_queries(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_p99_p95_ratio {
+                fail_bench_p99_p95_ratio(&report, threshold)?;
             }
             if let Some(threshold) = fail_fallback_rate {
                 fail_bench_fallback_rate(&report, threshold)?;
@@ -10025,6 +10070,7 @@ fn summarize_query(
     let p50_ms = percentile(&samples_ms, 0.50);
     let p95_ms = percentile(&samples_ms, 0.95);
     let p99_ms = percentile(&samples_ms, 0.99);
+    let p99_p95_ratio = if p95_ms > 0.0 { p99_ms / p95_ms } else { 0.0 };
     QueryBench {
         query: query.to_string(),
         result_count,
@@ -10045,6 +10091,7 @@ fn summarize_query(
         p50_ms: round_ms(p50_ms),
         p95_ms: round_ms(p95_ms),
         p99_ms: round_ms(p99_ms),
+        p99_p95_ratio: round_ratio(p99_p95_ratio),
         max_ms: round_ms(max_ms),
         fallback_count: None,
         stale_count: None,
@@ -10143,6 +10190,11 @@ fn summarize_bench_report(queries: &[QueryBench]) -> BenchSummary {
         max_p99_ms: queries
             .iter()
             .map(|query| query.p99_ms)
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0),
+        max_p99_p95_ratio: queries
+            .iter()
+            .map(|query| query.p99_p95_ratio)
             .max_by(f64::total_cmp)
             .unwrap_or(0.0),
         max_ms: queries
@@ -10290,6 +10342,23 @@ fn fail_bench_p99_queries(report: &BenchReport, threshold: f64) -> Result<()> {
             "p99 {:.3}ms for query {:?} exceeded threshold {:.3}ms",
             slowest.p99_ms,
             slowest.query,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_bench_p99_p95_ratio(report: &BenchReport, threshold: f64) -> Result<()> {
+    if let Some(widest) = report
+        .queries
+        .iter()
+        .filter(|query| query.p99_p95_ratio > threshold)
+        .max_by(|left, right| left.p99_p95_ratio.total_cmp(&right.p99_p95_ratio))
+    {
+        bail!(
+            "p99/p95 ratio {:.3} for query {:?} exceeded threshold {:.3}",
+            widest.p99_p95_ratio,
+            widest.query,
             threshold
         );
     }
