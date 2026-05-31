@@ -8660,6 +8660,18 @@ fn runtime_search_auto_scopes_warmed_shards_to_client_cwd() {
     let value = search.result.unwrap();
     assert_eq!(value["surface"], serde_json::json!("shards"));
     assert_eq!(
+        value["summary"]["shard_route"]["total_shards"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        value["summary"]["shard_route"]["selected_shards"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        value["summary"]["shard_route"]["routed"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
         value["query_plan_request"]["arguments"]["repo_filter"],
         serde_json::json!(current_repo.canonicalize().unwrap().to_string_lossy())
     );

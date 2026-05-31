@@ -1620,6 +1620,8 @@ struct SearchResultSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     top_langs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    shard_route: Option<ShardRouteStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_score: Option<f64>,
@@ -1643,6 +1645,7 @@ fn search_result_summary(results: &[SearchResult]) -> SearchResultSummary {
         top_dirs: search_summary_top_dirs(results),
         top_exts: search_summary_top_exts(results),
         top_langs: search_summary_top_langs(results),
+        shard_route: None,
         max_score: results.first().map(|result| result.score),
         min_score: results.last().map(|result| result.score),
     }
@@ -1683,6 +1686,16 @@ fn search_result_summary_with_primary_retry(
                 .collect()
         })
         .unwrap_or_default();
+    summary
+}
+
+fn search_result_summary_with_shard_route(
+    results: &[SearchResult],
+    primary_retry_result: &Option<Value>,
+    shard_route: ShardRouteStats,
+) -> SearchResultSummary {
+    let mut summary = search_result_summary_with_primary_retry(results, primary_retry_result);
+    summary.shard_route = Some(shard_route);
     summary
 }
 
@@ -4309,6 +4322,7 @@ fn run() -> Result<()> {
                     results.is_empty(),
                     primary_retry_request.as_ref(),
                 )?;
+                let shard_route = shard_query_route_stats(&index_dir, &query, &filters)?;
                 let read_batch_request = result_read_batch_request(
                     &results,
                     "read_ranges",
@@ -4320,7 +4334,7 @@ fn run() -> Result<()> {
                 );
                 let mut output = serde_json::json!({
                     "query": query,
-                    "summary": search_result_summary_with_primary_retry(&results, &primary_retry_result),
+                    "summary": search_result_summary_with_shard_route(&results, &primary_retry_result, shard_route),
                     "surface": "shards",
                     "target": index_dir,
                     "query_plan_request": {
@@ -4647,6 +4661,7 @@ fn run() -> Result<()> {
                         results.is_empty(),
                         primary_retry_request.as_ref(),
                     )?;
+                    let shard_route = shard_query_route_stats(&index_dir, &query, &filters)?;
                     let read_batch_request = result_read_batch_request(
                         &results,
                         "read_ranges",
@@ -4658,7 +4673,7 @@ fn run() -> Result<()> {
                     );
                     let mut item = serde_json::json!({
                         "query": query,
-                        "summary": search_result_summary_with_primary_retry(&results, &primary_retry_result),
+                        "summary": search_result_summary_with_shard_route(&results, &primary_retry_result, shard_route),
                         "surface": "shards",
                         "target": index_dir,
                         "query_plan_request": {

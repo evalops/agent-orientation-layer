@@ -21,15 +21,15 @@ use crate::repo_index::{
     symbol_lookup_results,
 };
 use crate::shards::{
-    ShardEntry, ShardFreshness, ShardManifest, ShardQueryPlan, ShardRepoMap, ShardSearchScope,
-    append_shard_facet_repair_hints, bounded_shard_worker_count, build_shards_with_force,
-    configured_max_shard_workers, ensure_shards, filter_repo_map_by_prefix,
-    filters_for_shard_scope, load_manifest, refresh_shards, refresh_shards_by_root,
-    related_query_without_shard_selectors, resolve_shard_path_from_manifest,
-    shard_early_result_target, shard_prefilter_query_impossible, shard_route_entries,
-    shard_route_selection, shard_search_scopes, shard_selection_miss_plan,
-    shard_sketch_may_diagnose_query, shard_sketch_may_match_query, shard_status,
-    shard_status_by_root,
+    ShardEntry, ShardFreshness, ShardManifest, ShardQueryPlan, ShardRepoMap, ShardRouteStats,
+    ShardSearchScope, append_shard_facet_repair_hints, bounded_shard_worker_count,
+    build_shards_with_force, configured_max_shard_workers, ensure_shards,
+    filter_repo_map_by_prefix, filters_for_shard_scope, load_manifest, refresh_shards,
+    refresh_shards_by_root, related_query_without_shard_selectors,
+    resolve_shard_path_from_manifest, shard_early_result_target, shard_prefilter_query_impossible,
+    shard_query_route_stats, shard_route_entries, shard_route_selection, shard_search_scopes,
+    shard_selection_miss_plan, shard_sketch_may_diagnose_query, shard_sketch_may_match_query,
+    shard_status, shard_status_by_root,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::{Context, Result, anyhow};
@@ -105,6 +105,8 @@ struct SearchResultSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     top_langs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    shard_route: Option<ShardRouteStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_score: Option<f64>,
@@ -144,6 +146,7 @@ fn search_result_summary(results: &[SearchResult]) -> SearchResultSummary {
         top_dirs: search_summary_top_dirs(results),
         top_exts: search_summary_top_exts(results),
         top_langs: search_summary_top_langs(results),
+        shard_route: None,
         max_score: results.first().map(|result| result.score),
         min_score: results.last().map(|result| result.score),
     }
@@ -184,6 +187,16 @@ fn search_result_summary_with_primary_retry(
                 .collect()
         })
         .unwrap_or_default();
+    summary
+}
+
+fn search_result_summary_with_shard_route(
+    results: &[SearchResult],
+    primary_retry_result: &Option<Value>,
+    shard_route: ShardRouteStats,
+) -> SearchResultSummary {
+    let mut summary = search_result_summary_with_primary_retry(results, primary_retry_result);
+    summary.shard_route = Some(shard_route);
     summary
 }
 
@@ -6844,6 +6857,7 @@ impl ToolRuntime {
             results.is_empty(),
             primary_retry_request.as_ref(),
         )?;
+        let shard_route = shard_query_route_stats(&index_dir, query, &filters)?;
         let freshness = self.search_auto_shard_freshness(
             !refresh_if_stale && (diagnose || results.is_empty()),
             &index_dir,
@@ -6879,7 +6893,11 @@ impl ToolRuntime {
         );
         Ok(SearchAutoResult {
             query: query.to_string(),
-            summary: search_result_summary_with_primary_retry(&results, &primary_retry_result),
+            summary: search_result_summary_with_shard_route(
+                &results,
+                &primary_retry_result,
+                shard_route,
+            ),
             surface: "shards".to_string(),
             target: index_dir.to_string_lossy().to_string(),
             refresh_request,
