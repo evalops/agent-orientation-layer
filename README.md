@@ -30,7 +30,9 @@ orient serve-tcp \
 `--index-dir` registers the shard manifest and lazily loads individual repo
 indexes on first use. Add `--warm-repo /path/to/current/repo` for the one or two
 active checkouts that should avoid first-touch latency without loading every
-shard. Add `--warm-query "file:README.md"` for startup query-result prewarming;
+shard; warm repo indexes are pinned so ordinary lazy loads do not evict them, and
+`--max-cached-indexes` applies to the evictable pool. Add
+`--warm-query "file:README.md"` for startup query-result prewarming;
 with `--warm-repo`, those query caches are repo-scoped. The daemon keeps at most
 64 lazy indexes by default; when using `--warm-index-dir`, it sizes the default
 cache to the warmed shard count. Set

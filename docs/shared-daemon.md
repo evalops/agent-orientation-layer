@@ -41,8 +41,11 @@ and set `ORIENT_MAX_DAEMON_SHARD_WORKERS=N` for aggregate daemon fanout. The
 daemon-wide fanout cap defaults to the per-query cap so many-agent runs do not
 multiply broad shard searches into CPU oversubscription. Add one or more
 `--warm-repo /path/to/checkout` flags to prewarm active repos without loading
-every shard. Add `--warm-query "file:README.md"` for common startup searches;
-when `--warm-repo` is present, query warming is scoped to those repo roots. Use
+every shard. Warm repo indexes are pinned, so the daemon evicts non-pinned lazy
+shards first even when `--max-cached-indexes` is small; the cache cap governs the
+evictable pool, while pinned warm repos stay resident. Add `--warm-query
+"file:README.md"` for common startup searches; when `--warm-repo` is present,
+query warming is scoped to those repo roots. Use
 `--warm-index-dir "$ORIENT_SHARDS"` only when you explicitly want all shard
 indexes loaded at startup.
 

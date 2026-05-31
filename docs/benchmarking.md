@@ -25,6 +25,9 @@ Orient has four benchmark layers:
 - `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
   warms shards, scopes requests through a checkout `cwd`, and gates repeated
   concurrent `search_auto` latency for the path coding agents normally use.
+- `tools/ci/orient_daemon_contention_perf.sh` is the multi-agent shared-daemon
+  benchmark. It warms and pins the active repos, then runs several client loops
+  through `bench-daemon-contend`.
 
 Run the local agent benchmark with:
 
@@ -52,6 +55,21 @@ tools/ci/orient_daemon_cwd_perf.sh
 Set `ORIENT_DAEMON_CWD_REBUILD_SHARDS=1` to rebuild shards, or leave it unset
 to reuse an existing shard directory when possible. The default p95 gate is
 300ms and can be changed with `ORIENT_DAEMON_CWD_P95_MS`.
+
+Run the multi-agent contention benchmark with:
+
+```bash
+ORIENT_DAEMON_CONTEND_ROOT=/path/to/projects \
+ORIENT_DAEMON_CONTEND_OUTPUT_DIR=/tmp/orient-shards \
+ORIENT_DAEMON_CONTEND_CWDS=/path/to/repo-a:/path/to/repo-b \
+ORIENT_DAEMON_CONTEND_MODE=both \
+tools/ci/orient_daemon_contention_perf.sh
+```
+
+Use `ORIENT_DAEMON_CONTEND_MODE=cold` to measure first-touch behavior, `warm`
+to measure pinned active repos, or `both` to run the pair. Query and range files
+can be supplied with `ORIENT_DAEMON_CONTEND_QUERY_FILE` and
+`ORIENT_DAEMON_CONTEND_RANGE_FILE`.
 
 ## Shared Daemon Matrix
 

@@ -1048,6 +1048,7 @@ fn mcp_error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 pub struct ToolRuntime {
     indexes: Mutex<HashMap<PathBuf, Arc<IndexCacheEntry>>>,
+    pinned_indexes: Mutex<HashSet<PathBuf>>,
     shard_manifests: Mutex<HashMap<PathBuf, CachedShardManifest>>,
     inflight_shard_searches: Mutex<HashMap<ShardSearchKey, Arc<InFlightWork<Vec<SearchResult>>>>>,
     inflight_shard_query_plans:
@@ -1082,6 +1083,7 @@ impl Default for ToolRuntime {
     fn default() -> Self {
         Self {
             indexes: Mutex::new(HashMap::new()),
+            pinned_indexes: Mutex::new(HashSet::default()),
             shard_manifests: Mutex::new(HashMap::new()),
             inflight_shard_searches: Mutex::new(HashMap::new()),
             inflight_shard_query_plans: Mutex::new(HashMap::new()),
@@ -1459,7 +1461,7 @@ impl ToolRuntime {
         let mut warmed = 0usize;
         for shard in &manifest.shards {
             if wanted.contains(&canonical_cache_key(&shard.root)) {
-                self.warm_index(index_dir.join(&shard.index))?;
+                self.warm_pinned_index(index_dir.join(&shard.index))?;
                 warmed += 1;
             }
         }
@@ -1501,6 +1503,10 @@ impl ToolRuntime {
             .lock()
             .map(|indexes| indexes.values().filter(|entry| entry.is_ready()).count())
             .unwrap_or(0)
+    }
+
+    pub fn pinned_cached_index_count(&self) -> usize {
+        self.pinned_index_paths().len()
     }
 
     pub fn cached_shard_manifest_count(&self) -> usize {
@@ -1560,6 +1566,7 @@ impl ToolRuntime {
         let cached_shard_manifest_details = self.cached_shard_manifest_details();
         let footprint =
             daemon_footprint_summary(&cached_index_details, &cached_shard_manifest_details);
+        let pinned_cached_indexes = self.pinned_cached_index_count();
         let repair_requests = self.daemon_repair_requests();
         let default_requests = client_cwd.as_deref().map_or_else(
             || daemon_default_requests(&search_auto_default),
@@ -1577,6 +1584,8 @@ impl ToolRuntime {
             "default_requests": default_requests,
             "max_cached_indexes": self.max_cached_indexes(),
             "cached_indexes": self.cached_index_count(),
+            "pinned_cached_indexes": pinned_cached_indexes,
+            "pinned_indexes_are_eviction_protected": pinned_cached_indexes > 0,
             "cached_shard_manifests": self.cached_shard_manifest_count(),
             "completed_shard_search_cache_entries": self.completed_shard_search_cache_entry_count(),
             "completed_shard_search_cache_hits": self.completed_shard_search_cache_hit_count(),
@@ -1586,6 +1595,8 @@ impl ToolRuntime {
         });
         if include_details {
             status["cached_index_paths"] = serde_json::to_value(self.cached_index_paths())
+                .unwrap_or_else(|_| Value::Array(Vec::new()));
+            status["pinned_cached_index_paths"] = serde_json::to_value(self.pinned_index_paths())
                 .unwrap_or_else(|_| Value::Array(Vec::new()));
             status["cached_index_details"] = Value::Array(cached_index_details);
             status["cached_shard_manifest_paths"] =
@@ -7982,7 +7993,35 @@ impl ToolRuntime {
         paths
     }
 
+    fn pinned_index_paths(&self) -> Vec<String> {
+        let pinned_indexes = self
+            .pinned_indexes
+            .lock()
+            .map(|pinned| pinned.clone())
+            .unwrap_or_default();
+        let mut paths = self
+            .indexes
+            .lock()
+            .map(|indexes| {
+                indexes
+                    .iter()
+                    .filter_map(|(path, entry)| {
+                        (pinned_indexes.contains(path) && entry.is_ready())
+                            .then(|| path.to_string_lossy().to_string())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        paths
+    }
+
     fn cached_index_details(&self) -> Vec<Value> {
+        let pinned_indexes = self
+            .pinned_indexes
+            .lock()
+            .map(|pinned| pinned.clone())
+            .unwrap_or_default();
         let mut details = self
             .indexes
             .lock()
@@ -8009,7 +8048,8 @@ impl ToolRuntime {
                                 "trigrams": stats.trigrams,
                                 "posting_entries": stats.posting_entries,
                                 "compressed_posting_bytes": stats.compressed_posting_bytes,
-                                "symbols": stats.symbols
+                                "symbols": stats.symbols,
+                                "pinned": pinned_indexes.contains(path)
                             })
                         })
                     })
@@ -8189,9 +8229,14 @@ impl ToolRuntime {
     }
 
     fn clear_runtime_caches(&self) -> Result<()> {
+        // Keep indexes and pinned_indexes in sync whenever cache entries are removed.
         self.indexes
             .lock()
             .map_err(|_| anyhow!("index cache lock poisoned"))?
+            .clear();
+        self.pinned_indexes
+            .lock()
+            .map_err(|_| anyhow!("pinned index cache lock poisoned"))?
             .clear();
         self.shard_manifests
             .lock()
@@ -8203,10 +8248,15 @@ impl ToolRuntime {
 
     fn evict_cached_indexes_in_dir(&self, index_dir: &Path) -> Result<()> {
         let index_dir = canonical_cache_key(index_dir);
+        // Keep indexes and pinned_indexes in sync whenever cache entries are removed.
         self.indexes
             .lock()
             .map_err(|_| anyhow!("index cache lock poisoned"))?
             .retain(|path, _| !path.starts_with(&index_dir));
+        self.pinned_indexes
+            .lock()
+            .map_err(|_| anyhow!("pinned index cache lock poisoned"))?
+            .retain(|path| !path.starts_with(&index_dir));
         self.invalidate_completed_shard_work_for_index_dir(&index_dir)?;
         Ok(())
     }
@@ -8217,6 +8267,11 @@ impl ToolRuntime {
         };
         let mut victims = Vec::new();
         {
+            let pinned_indexes = self
+                .pinned_indexes
+                .lock()
+                .map_err(|_| anyhow!("pinned index cache lock poisoned"))?
+                .clone();
             let mut indexes = self
                 .indexes
                 .lock()
@@ -8228,7 +8283,11 @@ impl ToolRuntime {
                 }
                 let victim = indexes
                     .iter()
-                    .filter(|(path, entry)| path.as_path() != protected && entry.is_ready())
+                    .filter(|(path, entry)| {
+                        path.as_path() != protected
+                            && !pinned_indexes.contains(path.as_path())
+                            && entry.is_ready()
+                    })
                     .filter_map(|(path, entry)| {
                         entry.last_access().map(|access| (path.clone(), access))
                     })
@@ -8245,6 +8304,23 @@ impl ToolRuntime {
             self.invalidate_completed_shard_work_for_index_path(&victim)?;
         }
         Ok(())
+    }
+
+    fn warm_pinned_index(&self, index_path: PathBuf) -> Result<PathBuf> {
+        let key = canonical_cache_key(&index_path);
+        self.pinned_indexes
+            .lock()
+            .map_err(|_| anyhow!("pinned index cache lock poisoned"))?
+            .insert(key.clone());
+        match self.warm_index(key.clone()) {
+            Ok(warmed) => Ok(warmed),
+            Err(error) => {
+                if let Ok(mut pinned) = self.pinned_indexes.lock() {
+                    pinned.remove(&key);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn search_shards_cached(

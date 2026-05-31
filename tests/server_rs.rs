@@ -10669,6 +10669,148 @@ fn runtime_bounds_lazy_shard_index_cache() {
 }
 
 #[test]
+fn runtime_keeps_warm_repo_shards_pinned_under_cache_pressure() {
+    let workspace = tempfile::tempdir().unwrap();
+    let auth_repo = workspace.path().join("auth");
+    write(
+        &auth_repo.join("src/lib.rs"),
+        "pub fn issue_token() -> usize { 1 }\n",
+    );
+    let billing_repo = workspace.path().join("billing");
+    write(
+        &billing_repo.join("src/lib.rs"),
+        "pub fn invoice_total() -> usize { 42 }\n",
+    );
+    let profile_repo = workspace.path().join("profile");
+    write(
+        &profile_repo.join("src/lib.rs"),
+        "pub fn profile_name() -> &'static str { \"Ada\" }\n",
+    );
+
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(
+        &[
+            auth_repo.clone(),
+            billing_repo.clone(),
+            profile_repo.clone(),
+        ],
+        shard_dir.path(),
+    )
+    .unwrap();
+
+    let runtime = ToolRuntime::with_max_cached_indexes(1);
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+    assert_eq!(
+        runtime
+            .warm_shard_roots(
+                shard_dir.path().to_path_buf(),
+                std::slice::from_ref(&auth_repo)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(runtime.cached_index_count(), 1);
+    assert_eq!(runtime.pinned_cached_index_count(), 1);
+
+    let billing_search = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("billing"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "invoice total",
+            "limit": 3,
+            "require_all": true
+        }),
+    });
+    assert!(billing_search.error.is_none(), "{:?}", billing_search.error);
+    assert!(
+        serde_json::to_string(&billing_search.result)
+            .unwrap()
+            .contains("invoice_total"),
+        "{:?}",
+        billing_search.result
+    );
+    assert_eq!(
+        runtime.cached_index_count(),
+        2,
+        "pinned warm repo should be allowed to exceed the soft cache cap"
+    );
+
+    let profile_search = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("profile"),
+        tool: "search_shards".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "profile name",
+            "limit": 3,
+            "require_all": true
+        }),
+    });
+    assert!(profile_search.error.is_none(), "{:?}", profile_search.error);
+    assert!(
+        serde_json::to_string(&profile_search.result)
+            .unwrap()
+            .contains("profile_name"),
+        "{:?}",
+        profile_search.result
+    );
+    assert_eq!(runtime.cached_index_count(), 2);
+
+    let status = runtime.daemon_status();
+    assert_eq!(status["max_cached_indexes"], serde_json::json!(1));
+    assert_eq!(status["pinned_cached_indexes"], serde_json::json!(1));
+    let roots = status["cached_index_details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|detail| detail["root"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        roots.contains(
+            &auth_repo
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "pinned auth shard should survive later lazy loads: {status}"
+    );
+    assert!(
+        roots.contains(
+            &profile_repo
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "most recent non-pinned shard should remain cached: {status}"
+    );
+    assert!(
+        !roots.contains(
+            &billing_repo
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "least-recent non-pinned shard should be evicted first: {status}"
+    );
+    let pinned = status["cached_index_details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|detail| detail["pinned"] == serde_json::json!(true))
+        .collect::<Vec<_>>();
+    assert_eq!(pinned.len(), 1, "{status}");
+    assert_eq!(
+        pinned[0]["root"],
+        serde_json::json!(auth_repo.canonicalize().unwrap().to_string_lossy())
+    );
+}
+
+#[test]
 fn daemon_status_with_cwd_returns_checkout_scoped_default_requests() {
     let workspace = tempfile::tempdir().unwrap();
     let auth_repo = workspace.path().join("auth");
