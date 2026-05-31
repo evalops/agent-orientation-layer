@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -10031,6 +10031,122 @@ fn runtime_serves_parallel_warm_shard_searches() {
         assert!(result.contains("service_"), "{result}");
     }
     assert_eq!(runtime.cached_index_count(), 6);
+}
+
+#[test]
+fn runtime_coalesces_parallel_cold_shard_searches() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    let body = (0..400)
+        .map(|line| format!("pub fn shared_search_token_{line}() -> usize {{ {line} }}\n"))
+        .collect::<String>();
+    for index in 0..10 {
+        let repo = root.path().join(format!("service_{index}"));
+        write(&repo.join("src/lib.rs"), &body);
+        write(
+            &repo.join("Cargo.toml"),
+            &format!("[package]\nname='service-{index}'\nversion='0.1.0'\nedition='2024'\n"),
+        );
+        repos.push(repo);
+    }
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+
+    let runtime = Arc::new(ToolRuntime::default());
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+    assert_eq!(runtime.cached_index_count(), 0);
+
+    let barrier = Arc::new(Barrier::new(12));
+    let mut handles = Vec::new();
+    for index in 0..12 {
+        let runtime = Arc::clone(&runtime);
+        let shard_dir = shard_dir.path().to_path_buf();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            runtime.dispatch(ToolRequest {
+                id: serde_json::json!(index),
+                tool: "search_shards".to_string(),
+                arguments: serde_json::json!({
+                    "index_dir": shard_dir,
+                    "query": "shared search token",
+                    "limit": 5,
+                    "require_all": true
+                }),
+            })
+        }));
+    }
+
+    for handle in handles {
+        let response = handle.join().unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = serde_json::to_string(&response.result).unwrap();
+        assert!(result.contains("shared_search_token"), "{result}");
+    }
+    assert!(
+        runtime.coalesced_shard_search_waiter_count() > 0,
+        "parallel identical shard searches should share the in-flight fanout"
+    );
+}
+
+#[test]
+fn runtime_coalesces_parallel_empty_shard_query_plans() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for index in 0..10 {
+        let repo = root.path().join(format!("service_{index}"));
+        write(
+            &repo.join("src/lib.rs"),
+            &format!("pub fn present_search_token_{index}() -> usize {{ {index} }}\n"),
+        );
+        write(
+            &repo.join("Cargo.toml"),
+            &format!("[package]\nname='service-{index}'\nversion='0.1.0'\nedition='2024'\n"),
+        );
+        repos.push(repo);
+    }
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+
+    let runtime = Arc::new(ToolRuntime::default());
+    runtime
+        .register_shards(shard_dir.path().to_path_buf())
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(12));
+    let mut handles = Vec::new();
+    for index in 0..12 {
+        let runtime = Arc::clone(&runtime);
+        let shard_dir = shard_dir.path().to_path_buf();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            runtime.dispatch(ToolRequest {
+                id: serde_json::json!(index),
+                tool: "search_auto".to_string(),
+                arguments: serde_json::json!({
+                    "index_dir": shard_dir,
+                    "query": "missing_search_token",
+                    "limit": 5,
+                    "require_all": true
+                }),
+            })
+        }));
+    }
+
+    for handle in handles {
+        let response = handle.join().unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["summary"]["result_count"], serde_json::json!(0));
+        assert!(result.get("query_plan_result").is_some(), "{result}");
+    }
+    assert!(
+        runtime.coalesced_shard_query_plan_waiter_count() > 0,
+        "parallel identical miss diagnostics should share the in-flight shard query plan"
+    );
 }
 
 #[test]

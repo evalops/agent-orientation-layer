@@ -1046,6 +1046,11 @@ fn mcp_error(id: Value, code: i64, message: impl Into<String>) -> Value {
 pub struct ToolRuntime {
     indexes: Mutex<HashMap<PathBuf, Arc<IndexCacheEntry>>>,
     shard_manifests: Mutex<HashMap<PathBuf, CachedShardManifest>>,
+    inflight_shard_searches: Mutex<HashMap<ShardSearchKey, Arc<InFlightWork<Vec<SearchResult>>>>>,
+    inflight_shard_query_plans:
+        Mutex<HashMap<ShardQueryPlanKey, Arc<InFlightWork<Vec<ShardQueryPlan>>>>>,
+    coalesced_shard_search_waiters: AtomicU64,
+    coalesced_shard_query_plan_waiters: AtomicU64,
     next_index_access: AtomicU64,
     cache_policy: IndexCachePolicy,
     shard_worker_pool: ShardWorkerPool,
@@ -1062,6 +1067,10 @@ impl Default for ToolRuntime {
         Self {
             indexes: Mutex::new(HashMap::new()),
             shard_manifests: Mutex::new(HashMap::new()),
+            inflight_shard_searches: Mutex::new(HashMap::new()),
+            inflight_shard_query_plans: Mutex::new(HashMap::new()),
+            coalesced_shard_search_waiters: AtomicU64::new(0),
+            coalesced_shard_query_plan_waiters: AtomicU64::new(0),
             next_index_access: AtomicU64::new(1),
             cache_policy: IndexCachePolicy::default(),
             shard_worker_pool: ShardWorkerPool::new(configured_max_daemon_shard_workers()),
@@ -1079,6 +1088,31 @@ struct ShardWorkerPool {
 struct ShardWorkerPermit<'a> {
     pool: &'a ShardWorkerPool,
     count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShardSearchKey {
+    index_dir: PathBuf,
+    query: String,
+    limit: usize,
+    filters: SearchFilters,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShardQueryPlanKey {
+    index_dir: PathBuf,
+    query: String,
+    filters: SearchFilters,
+}
+
+struct InFlightWork<T> {
+    state: Mutex<InFlightWorkState<T>>,
+    ready: Condvar,
+}
+
+enum InFlightWorkState<T> {
+    Running,
+    Complete(Result<T, String>),
 }
 
 impl ShardWorkerPool {
@@ -1131,6 +1165,46 @@ impl Drop for ShardWorkerPermit<'_> {
         if let Ok(mut available) = self.pool.available.lock() {
             *available = (*available + self.count).min(self.pool.limit);
             self.pool.ready.notify_all();
+        }
+    }
+}
+
+impl<T: Clone> InFlightWork<T> {
+    fn running() -> Self {
+        Self {
+            state: Mutex::new(InFlightWorkState::Running),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, result: Result<T, String>) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("in-flight work lock poisoned"))?;
+        *state = InFlightWorkState::Complete(result);
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    fn wait(&self) -> Result<T> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("in-flight work lock poisoned"))?;
+        loop {
+            match &*state {
+                InFlightWorkState::Running => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .map_err(|_| anyhow!("in-flight work lock poisoned"))?;
+                }
+                InFlightWorkState::Complete(Ok(value)) => return Ok(value.clone()),
+                InFlightWorkState::Complete(Err(message)) => {
+                    return Err(anyhow!(message.clone()));
+                }
+            }
         }
     }
 }
@@ -1349,6 +1423,18 @@ impl ToolRuntime {
             .lock()
             .map(|manifests| manifests.len())
             .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn coalesced_shard_search_waiter_count(&self) -> u64 {
+        self.coalesced_shard_search_waiters
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn coalesced_shard_query_plan_waiter_count(&self) -> u64 {
+        self.coalesced_shard_query_plan_waiters
+            .load(AtomicOrdering::Relaxed)
     }
 
     pub fn max_cached_indexes(&self) -> usize {
@@ -7683,29 +7769,8 @@ impl ToolRuntime {
         let parsed = parse_query(query);
         let filters = merge_filters(filters.clone(), parsed.filters);
         let shard_query = query_text(&parsed.terms, &filters);
-        if shard_prefilter_query_impossible(index_dir, &shard_query, &filters)? {
-            return Ok(Vec::new());
-        }
-        let jobs = if let Some(shards) = shard_route_entries(index_dir, &shard_query, &filters)? {
-            shard_jobs_from_entries(shards, &shard_query, &filters, true)
-        } else if let Some(manifest) = self.cached_shard_manifest_if_fresh(index_dir)? {
-            shard_jobs_from_entries(
-                manifest.shards.iter().cloned(),
-                &shard_query,
-                &filters,
-                true,
-            )
-        } else {
-            let manifest = self.cached_shard_manifest(index_dir)?;
-            shard_jobs_from_entries(
-                manifest.shards.iter().cloned(),
-                &shard_query,
-                &filters,
-                true,
-            )
-        };
         let results =
-            self.search_shard_jobs_cached(index_dir, &shard_query, limit, &filters, jobs)?;
+            self.coalesced_search_shards_cached_core(index_dir, &shard_query, limit, &filters)?;
         let mut results = finalize_results_for_filters(results, limit, &filters);
         attach_result_context(&mut results, context_lines, |path, start, lines| {
             self.read_shard_range_cached(index_dir, path, start, lines)
@@ -7727,6 +7792,80 @@ impl ToolRuntime {
             Some(query),
             read_request_args("index_dir", index_dir),
         );
+        Ok(results)
+    }
+
+    fn coalesced_search_shards_cached_core(
+        &self,
+        index_dir: &std::path::Path,
+        shard_query: &str,
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<SearchResult>> {
+        let key = ShardSearchKey {
+            index_dir: index_dir.to_path_buf(),
+            query: shard_query.to_string(),
+            limit,
+            filters: filters.clone(),
+        };
+        let (entry, leader) = {
+            let mut searches = self
+                .inflight_shard_searches
+                .lock()
+                .map_err(|_| anyhow!("in-flight shard search map lock poisoned"))?;
+            if let Some(entry) = searches.get(&key) {
+                self.coalesced_shard_search_waiters
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                (Arc::clone(entry), false)
+            } else {
+                let entry = Arc::new(InFlightWork::running());
+                searches.insert(key.clone(), Arc::clone(&entry));
+                (entry, true)
+            }
+        };
+
+        if !leader {
+            return entry.wait();
+        }
+
+        let result = self.search_shards_cached_core(index_dir, shard_query, limit, filters);
+        let shared_result = match &result {
+            Ok(results) => Ok(results.clone()),
+            Err(error) => Err(error.to_string()),
+        };
+        let finish_result = entry.finish(shared_result);
+        if let Ok(mut searches) = self.inflight_shard_searches.lock() {
+            if searches
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                searches.remove(&key);
+            }
+        }
+        finish_result?;
+        result
+    }
+
+    fn search_shards_cached_core(
+        &self,
+        index_dir: &std::path::Path,
+        shard_query: &str,
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<SearchResult>> {
+        if shard_prefilter_query_impossible(index_dir, shard_query, filters)? {
+            return Ok(Vec::new());
+        }
+        let jobs = if let Some(shards) = shard_route_entries(index_dir, shard_query, filters)? {
+            shard_jobs_from_entries(shards, shard_query, filters, true)
+        } else if let Some(manifest) = self.cached_shard_manifest_if_fresh(index_dir)? {
+            shard_jobs_from_entries(manifest.shards.iter().cloned(), shard_query, filters, true)
+        } else {
+            let manifest = self.cached_shard_manifest(index_dir)?;
+            shard_jobs_from_entries(manifest.shards.iter().cloned(), shard_query, filters, true)
+        };
+        let results =
+            self.search_shard_jobs_cached(index_dir, shard_query, limit, filters, jobs)?;
         Ok(results)
     }
 
@@ -7820,10 +7959,72 @@ impl ToolRuntime {
         let parsed = parse_query(query);
         let filters = merge_filters(filters.clone(), parsed.filters);
         let shard_query = query_text(&parsed.terms, &filters);
-        let route_selection = shard_route_selection(index_dir, &shard_query, &filters)?;
+        let mut plans =
+            self.coalesced_shard_query_plans_cached_core(index_dir, &shard_query, &filters)?;
+        plans.sort_by(|left, right| left.name.cmp(&right.name));
+        append_shard_facet_repair_hints(&mut plans, &parsed.terms, &filters);
+        Ok(plans)
+    }
+
+    fn coalesced_shard_query_plans_cached_core(
+        &self,
+        index_dir: &std::path::Path,
+        shard_query: &str,
+        filters: &SearchFilters,
+    ) -> Result<Vec<ShardQueryPlan>> {
+        let key = ShardQueryPlanKey {
+            index_dir: index_dir.to_path_buf(),
+            query: shard_query.to_string(),
+            filters: filters.clone(),
+        };
+        let (entry, leader) = {
+            let mut plans = self
+                .inflight_shard_query_plans
+                .lock()
+                .map_err(|_| anyhow!("in-flight shard query plan map lock poisoned"))?;
+            if let Some(entry) = plans.get(&key) {
+                self.coalesced_shard_query_plan_waiters
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                (Arc::clone(entry), false)
+            } else {
+                let entry = Arc::new(InFlightWork::running());
+                plans.insert(key.clone(), Arc::clone(&entry));
+                (entry, true)
+            }
+        };
+
+        if !leader {
+            return entry.wait();
+        }
+
+        let result = self.shard_query_plans_cached_core(index_dir, shard_query, filters);
+        let shared_result = match &result {
+            Ok(plans) => Ok(plans.clone()),
+            Err(error) => Err(error.to_string()),
+        };
+        let finish_result = entry.finish(shared_result);
+        if let Ok(mut plans) = self.inflight_shard_query_plans.lock() {
+            if plans
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                plans.remove(&key);
+            }
+        }
+        finish_result?;
+        result
+    }
+
+    fn shard_query_plans_cached_core(
+        &self,
+        index_dir: &std::path::Path,
+        shard_query: &str,
+        filters: &SearchFilters,
+    ) -> Result<Vec<ShardQueryPlan>> {
+        let route_selection = shard_route_selection(index_dir, shard_query, filters)?;
         let (jobs, shard_count, shard_names) = if let Some(selection) = route_selection {
             (
-                shard_jobs_from_entries(selection.shards, &shard_query, &filters, false),
+                shard_jobs_from_entries(selection.shards, shard_query, filters, false),
                 selection.shard_count,
                 selection.shard_names,
             )
@@ -7840,7 +8041,7 @@ impl ToolRuntime {
                 .iter()
                 .cloned()
                 .filter_map(|shard| {
-                    let scopes = shard_search_scopes(&shard, &filters);
+                    let scopes = shard_search_scopes(&shard, filters);
                     (!scopes.is_empty()).then_some(ShardJob { shard, scopes })
                 })
                 .collect::<Vec<_>>();
@@ -7850,16 +8051,13 @@ impl ToolRuntime {
         if jobs.is_empty() {
             return Ok(vec![shard_selection_miss_plan(
                 index_dir,
-                &shard_query,
-                &filters,
+                shard_query,
+                filters,
                 shard_count,
                 shard_names,
             )]);
         }
-        let mut plans =
-            self.shard_query_plan_jobs_cached(index_dir, &shard_query, &filters, jobs)?;
-        plans.sort_by(|left, right| left.name.cmp(&right.name));
-        append_shard_facet_repair_hints(&mut plans, &parsed.terms, &filters);
+        let plans = self.shard_query_plan_jobs_cached(index_dir, shard_query, filters, jobs)?;
         Ok(plans)
     }
 

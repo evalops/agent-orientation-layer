@@ -904,7 +904,7 @@ pub struct DuplicateGroup {
     pub duplicate_paths: Vec<String>,
 }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub enum SnippetMode {
     Short,
     #[default]
@@ -941,7 +941,7 @@ impl SnippetMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SearchFilters {
     pub file: Option<String>,
     pub path: Option<String>,
