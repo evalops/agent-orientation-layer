@@ -11167,6 +11167,52 @@ fn runtime_shard_query_plan_suggests_repo_facet_for_broad_queries() {
 }
 
 #[test]
+fn runtime_search_auto_summary_warns_on_broad_shard_fanout() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for index in 0..16 {
+        let repo = root.path().join(format!("service_{index:02}"));
+        write(
+            &repo.join("src/lib.rs"),
+            &format!("pub fn common_fanout_beacon_{index}() -> usize {{ {index} }}\n"),
+        );
+        write(
+            &repo.join("Cargo.toml"),
+            &format!("[package]\nname='service-{index:02}'\nversion='0.1.0'\nedition='2024'\n"),
+        );
+        repos.push(repo);
+    }
+
+    let shard_dir = tempfile::tempdir().unwrap();
+    build_shards(&repos, shard_dir.path()).unwrap();
+    let runtime = ToolRuntime::default();
+    let response = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("search"),
+        tool: "search_auto".to_string(),
+        arguments: serde_json::json!({
+            "index_dir": shard_dir.path(),
+            "query": "common fanout beacon",
+            "limit": 3
+        }),
+    });
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    let warning = &result["summary"]["fanout_warning"];
+    assert_eq!(warning["status"], serde_json::json!("broad_shard_fanout"));
+    assert_eq!(warning["selected_shards"], serde_json::json!(16));
+    assert_eq!(warning["total_shards"], serde_json::json!(16));
+    assert!(
+        warning["message"].as_str().unwrap().contains("repo:"),
+        "{warning:?}"
+    );
+    assert_eq!(warning["suggested_filters"][0], serde_json::json!("repo"));
+    assert_eq!(
+        result["summary"]["shard_route"]["selected_shards"],
+        serde_json::json!(16)
+    );
+}
+
+#[test]
 fn runtime_filters_shard_search_by_nested_repo_alias() {
     let workspace = tempfile::tempdir().unwrap();
     let billing_repo = workspace.path().join("billing");

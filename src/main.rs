@@ -1663,9 +1663,20 @@ struct SearchResultSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     shard_route: Option<ShardRouteStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fanout_warning: Option<SearchFanoutWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SearchFanoutWarning {
+    status: &'static str,
+    selected_shards: usize,
+    total_shards: usize,
+    message: String,
+    suggested_filters: Vec<&'static str>,
 }
 
 fn search_result_summary(results: &[SearchResult]) -> SearchResultSummary {
@@ -1687,6 +1698,7 @@ fn search_result_summary(results: &[SearchResult]) -> SearchResultSummary {
         top_exts: search_summary_top_exts(results),
         top_langs: search_summary_top_langs(results),
         shard_route: None,
+        fanout_warning: None,
         max_score: results.first().map(|result| result.score),
         min_score: results.last().map(|result| result.score),
     }
@@ -1736,8 +1748,25 @@ fn search_result_summary_with_shard_route(
     shard_route: ShardRouteStats,
 ) -> SearchResultSummary {
     let mut summary = search_result_summary_with_primary_retry(results, primary_retry_result);
+    summary.fanout_warning = shard_fanout_warning(&shard_route);
     summary.shard_route = Some(shard_route);
     summary
+}
+
+fn shard_fanout_warning(shard_route: &ShardRouteStats) -> Option<SearchFanoutWarning> {
+    if !shard_route.routed || shard_route.selected_shards < 16 {
+        return None;
+    }
+    Some(SearchFanoutWarning {
+        status: "broad_shard_fanout",
+        selected_shards: shard_route.selected_shards,
+        total_shards: shard_route.total_shards,
+        message: format!(
+            "Search selected {}/{} shards. Add repo:, path:, file:, lang:, ext:, or test: filters when you know the target area.",
+            shard_route.selected_shards, shard_route.total_shards
+        ),
+        suggested_filters: vec!["repo", "path", "file", "lang", "ext", "test"],
+    })
 }
 
 fn main_is_zero(value: &usize) -> bool {

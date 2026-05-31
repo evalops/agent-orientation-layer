@@ -155,8 +155,8 @@ use `find_symbol_batch` when the next step is opening all matching definitions.
 Orient can choose the best immediate follow-up. Search summaries also surface
 grouped duplicate counts when repeated worktree or copied files collapse into a
 canonical result. Shard-backed search summaries include `shard_route` with the
-route status and selected shard count, so broad searches are visible without
-opening the full plan. Use those compact fields first; open the full plan only
+route status and selected shard count, plus `fanout_warning` when a broad query
+selects many shards. Use those compact fields first; open the full plan only
 when a wrapper needs detailed diagnostics. For direct diagnostics, pass JSON-lines
 `summary:true` or add `--summary` to `search-auto`, `search-auto-batch`,
 `search-plan`, `search-plan-batch`, `index-plan`, or `index-plan-batch`.
