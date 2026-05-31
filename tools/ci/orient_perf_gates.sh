@@ -30,6 +30,7 @@ route_workspace="${tmpdir}/route-workspace"
 route_shard_dir="${tmpdir}/route-shards"
 churn_repo="${tmpdir}/churn-repo"
 churn_shard_dir="${tmpdir}/churn-shards"
+cold_daemon_addr="${ORIENT_PERF_GATES_COLD_DAEMON_ADDR:-127.0.0.1:8794}"
 
 target/release/orient bench-search \
   --repo . \
@@ -101,7 +102,7 @@ route_repos=()
 for index in $(seq 0 95); do
   repo="${route_workspace}/route-repo-${index}"
   route_repos+=(--repo "${repo}")
-  mkdir -p "${repo}/src"
+  mkdir -p "${repo}/src" "${repo}/.git"
   cat > "${repo}/src/lib.rs" <<EOF
 pub fn commonroutegate() -> usize { ${index} }
 pub fn read() -> usize { ${index} }
@@ -158,6 +159,56 @@ target/release/orient bench-shards \
   --limit 10 \
   --fail-p95-ms 50 \
   "symbol:RouteSymbolManager token"
+
+cold_daemon_log="${tmpdir}/orient-daemon-cold.log"
+target/release/orient serve-tcp \
+  --addr "${cold_daemon_addr}" \
+  --index-dir "${route_shard_dir}" \
+  --max-cached-indexes 2 \
+  >"${cold_daemon_log}" 2>&1 &
+daemon_pid="$!"
+
+cold_ready=0
+for _ in $(seq 1 60); do
+  if printf '%s\n' '{"id":"status","tool":"daemon_status","arguments":{}}' \
+    | target/release/orient client-jsonl --addr "${cold_daemon_addr}" --require-version >/dev/null 2>&1; then
+    cold_ready=1
+    break
+  fi
+  if ! kill -0 "${daemon_pid}" 2>/dev/null; then
+    echo "daemon exited before cold contention gate readiness" >&2
+    cat "${cold_daemon_log}" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+if [[ "${cold_ready}" != "1" ]]; then
+  echo "daemon did not become ready for cold contention gate at ${cold_daemon_addr}" >&2
+  cat "${cold_daemon_log}" >&2 || true
+  exit 1
+fi
+
+cold_cwds=()
+for index in $(seq 0 7); do
+  cold_cwds+=(--cwd "${route_workspace}/route-repo-${index}")
+done
+target/release/orient bench-daemon-contend \
+  --addr "${cold_daemon_addr}" \
+  "${cold_cwds[@]}" \
+  --clients 8 \
+  --runs 3 \
+  --warmup 0 \
+  --jitter-ms 0 \
+  --limit 10 \
+  --request-timeout-ms 30000 \
+  --fail-p95-ms 250 \
+  --fail-first-wave-p95-ms 250 \
+  --fail-fallback-rate 0 \
+  --query "commonroutegate"
+
+kill "${daemon_pid}" 2>/dev/null || true
+wait "${daemon_pid}" 2>/dev/null || true
+daemon_pid=""
 
 mkdir -p "${churn_repo}/src" "${churn_repo}/.git"
 cat > "${churn_repo}/Cargo.toml" <<'EOF'

@@ -1115,6 +1115,8 @@ enum Commands {
         fail_p95_ms: Option<f64>,
         #[arg(long)]
         fail_fallback_rate: Option<f64>,
+        #[arg(long)]
+        fail_first_wave_p95_ms: Option<f64>,
     },
     ToolManifest {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
@@ -6145,6 +6147,7 @@ fn run() -> Result<()> {
             range_args,
             fail_p95_ms,
             fail_fallback_rate,
+            fail_first_wave_p95_ms,
         } => {
             let filters = search_filters_from_args(&filters, repo_filter)?;
             let operations = cli_benchmark_mix_operations(query_args, range_args)?;
@@ -6166,6 +6169,9 @@ fn run() -> Result<()> {
             }
             if let Some(threshold) = fail_fallback_rate {
                 fail_bench_fallback_rate(&report, threshold)?;
+            }
+            if let Some(threshold) = fail_first_wave_p95_ms {
+                fail_bench_first_wave_p95(&report, threshold)?;
             }
         }
         Commands::ToolManifest { format: _format } => {
@@ -9429,6 +9435,23 @@ fn fail_bench_refresh_overhead(report: &BenchReport, threshold: f64) -> Result<(
         bail!(
             "refresh overhead p95 {:.3}ms exceeded threshold {:.3}ms",
             refresh_overhead,
+            threshold
+        );
+    }
+    Ok(())
+}
+
+fn fail_bench_first_wave_p95(report: &BenchReport, threshold: f64) -> Result<()> {
+    let Some(first_wave_p95) = report.summary.first_wave_p95_ms else {
+        bail!(
+            "first-wave p95 is unavailable for benchmark mode {:?}",
+            report.mode
+        );
+    };
+    if first_wave_p95 > threshold {
+        bail!(
+            "first-wave p95 {:.3}ms exceeded threshold {:.3}ms",
+            first_wave_p95,
             threshold
         );
     }
