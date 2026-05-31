@@ -1,6 +1,6 @@
 # Benchmarking
 
-Orient has two benchmark layers:
+Orient has three benchmark layers:
 
 - `tools/ci/orient_perf_gates.sh` is the small CI gate. It keeps release builds,
   unit-level search behavior, JSON-lines smoke coverage, and latency regressions
@@ -8,6 +8,9 @@ Orient has two benchmark layers:
 - `tools/ci/orient_agent_query_perf.sh` is the local agent-workload benchmark.
   It discovers a local workspace, builds shards with worktree-family limiting,
   and runs a mixed query set that looks like what coding agents ask for.
+- `orient bench-daemon` is the shared-daemon concurrency benchmark. It sends
+  simultaneous JSON-lines `search_auto` requests to one daemon so a local
+  multi-agent setup can check queueing and tail latency.
 
 Run the local agent benchmark with:
 
@@ -22,6 +25,23 @@ Use `ORIENT_AGENT_QUERY_FILE=/path/to/queries.txt` to replace the default query
 set. Blank lines and `#` comments are ignored. Use
 `ORIENT_AGENT_REBUILD_SHARDS=0` to reuse an existing shard directory, and set
 `ORIENT_AGENT_FALLBACK=0` when only cached shard latency matters.
+
+For a running shared daemon, check concurrent local-agent search latency with:
+
+```bash
+orient bench-daemon \
+  --addr 127.0.0.1:8796 \
+  --cwd /path/to/current/repo \
+  --concurrency 10 \
+  --runs 10 \
+  --warmup 2 \
+  --query "symbol:SessionManager token" \
+  --query "file:Cargo.toml"
+```
+
+`bench-daemon` reports one sample per request, so `sample_count` is
+`runs * concurrency * query_count`. Use `--cwd` to mirror how agent wrappers
+scope shared shard daemons to the current checkout.
 
 The default query set intentionally mixes:
 
@@ -47,5 +67,6 @@ Current local baselines show the useful shape:
   milliseconds, but broad unscoped all-shard queries can reach second-scale p95.
 
 That points the next performance work at global shard routing for broad queries,
-symbol-kind/path-aware shard prefilters, and concurrency/tail-latency benchmarks.
+symbol-kind/path-aware shard prefilters, and daemon queueing under concurrent
+local agents.
 Do not commit local benchmark JSONL files from private workspaces.

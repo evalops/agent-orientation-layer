@@ -199,17 +199,20 @@ bazel run //:ci_full_test
 bazel run //:ci_perf_gates
 ORIENT_WIDE_SHARDS=0 bazel run //:ci_wide_perf
 ORIENT_AGENT_ROOT=/path/to/projects tools/ci/orient_agent_query_perf.sh
+orient bench-daemon --addr 127.0.0.1:8796 --cwd . --concurrency 10 "symbol:SessionManager token"
 ```
 
 The wide perf gate chooses the local projects workspace when it exists, then
 falls back to the common code workspace; set `ORIENT_WIDE_ROOT` to force a
 different local root.
 
-`bench-search` and `bench-shards` emit per-query samples plus a compact
+`bench-search`, `bench-shards`, and `bench-daemon` emit per-query samples plus a compact
 `summary` with query count, total samples, max p95/p99, max sample, and the
 slowest query. Use `--fail-p95-ms` for hard gates and `--baseline` /
 `--write-baseline` for regression checks. `bench-shards` also reports
-`shard_route` so slow queries show their selected shard count.
+`shard_route` so slow queries show their selected shard count. `bench-daemon`
+uses concurrent JSON-lines `search_auto` requests to measure shared-daemon
+queueing under local multi-agent load.
 
 ## Docs
 

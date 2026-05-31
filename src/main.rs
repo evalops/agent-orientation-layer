@@ -44,7 +44,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Instant;
 
 const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8796";
@@ -927,6 +928,41 @@ enum Commands {
         #[arg(required_unless_present = "query_args", allow_hyphen_values = true)]
         queries: Vec<String>,
     },
+    BenchDaemon {
+        #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
+        socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "TCP daemon address; falls back to ORIENT_ADDR or 127.0.0.1:8796"
+        )]
+        addr: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 10)]
+        runs: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long = "repo-filter")]
+        repo_filter: Option<String>,
+        #[command(flatten)]
+        filters: CommonSearchArgs,
+        #[arg(long)]
+        fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.25)]
+        max_p95_regression: f64,
+        #[arg(long = "query", value_name = "QUERY")]
+        query_args: Vec<String>,
+        #[arg(required_unless_present = "query_args", allow_hyphen_values = true)]
+        queries: Vec<String>,
+    },
     ToolManifest {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
         format: String,
@@ -1553,6 +1589,8 @@ struct BenchReport {
     runs: usize,
     warmup: usize,
     limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    concurrency: Option<usize>,
     #[serde(default)]
     summary: BenchSummary,
     queries: Vec<QueryBench>,
@@ -5676,6 +5714,46 @@ fn run() -> Result<()> {
                 fail_slow_bench_queries(&report, threshold)?;
             }
         }
+        Commands::BenchDaemon {
+            socket,
+            addr,
+            cwd,
+            concurrency,
+            runs,
+            warmup,
+            limit,
+            repo_filter,
+            filters,
+            fail_p95_ms,
+            baseline,
+            write_baseline,
+            max_p95_regression,
+            query_args,
+            queries,
+        } => {
+            let queries = cli_benchmark_queries(query_args, queries)?;
+            let filters = search_filters_from_args(&filters, repo_filter)?;
+            let report = bench_daemon(DaemonBenchConfig {
+                target: resolve_daemon_target(socket, addr),
+                cwd,
+                concurrency,
+                runs,
+                warmup,
+                limit,
+                filters,
+                queries,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            if let Some(path) = write_baseline {
+                write_bench_baseline(&path, &report)?;
+            }
+            if let Some(path) = baseline {
+                compare_bench_baseline(&path, &report, max_p95_regression, false, false)?;
+            }
+            if let Some(threshold) = fail_p95_ms {
+                fail_slow_bench_queries(&report, threshold)?;
+            }
+        }
         Commands::ToolManifest { format: _format } => {
             println!("{}", serde_json::to_string(&tool_manifest())?);
         }
@@ -7412,6 +7490,17 @@ struct ShardBenchConfig {
     queries: Vec<String>,
 }
 
+struct DaemonBenchConfig {
+    target: DaemonTarget,
+    cwd: Option<PathBuf>,
+    concurrency: usize,
+    runs: usize,
+    warmup: usize,
+    limit: usize,
+    filters: SearchFilters,
+    queries: Vec<String>,
+}
+
 fn bench_search(config: BenchConfig) -> Result<BenchReport> {
     let runs = config.runs.max(1);
     let indexed = match (config.mode, config.index.as_ref()) {
@@ -7464,6 +7553,7 @@ fn bench_search(config: BenchConfig) -> Result<BenchReport> {
         runs,
         config.warmup,
         config.limit,
+        None,
         query_reports,
     ))
 }
@@ -7523,6 +7613,53 @@ fn bench_shards(config: ShardBenchConfig) -> Result<BenchReport> {
         runs,
         config.warmup,
         config.limit,
+        None,
+        query_reports,
+    ))
+}
+
+fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
+    let runs = config.runs.max(1);
+    let concurrency = config.concurrency.max(1);
+    let mut query_reports = Vec::new();
+
+    for query in &config.queries {
+        for _ in 0..config.warmup {
+            let _ = run_daemon_search_wave(
+                &config.target,
+                config.cwd.as_deref(),
+                query,
+                config.limit,
+                &config.filters,
+                concurrency,
+            )?;
+        }
+
+        let mut samples_ms = Vec::with_capacity(runs * concurrency);
+        let mut result_count = 0usize;
+        for _ in 0..runs {
+            let wave = run_daemon_search_wave(
+                &config.target,
+                config.cwd.as_deref(),
+                query,
+                config.limit,
+                &config.filters,
+                concurrency,
+            )?;
+            for sample in wave {
+                samples_ms.push(sample.elapsed_ms);
+                result_count = sample.result_count;
+            }
+        }
+        query_reports.push(summarize_query(query, result_count, samples_ms, None));
+    }
+
+    Ok(bench_report(
+        "daemon".to_string(),
+        runs,
+        config.warmup,
+        config.limit,
+        Some(concurrency),
         query_reports,
     ))
 }
@@ -7532,6 +7669,7 @@ fn bench_report(
     runs: usize,
     warmup: usize,
     limit: usize,
+    concurrency: Option<usize>,
     queries: Vec<QueryBench>,
 ) -> BenchReport {
     BenchReport {
@@ -7539,9 +7677,102 @@ fn bench_report(
         runs,
         warmup,
         limit,
+        concurrency,
         summary: summarize_bench_report(&queries),
         queries,
     }
+}
+
+struct DaemonBenchSample {
+    result_count: usize,
+    elapsed_ms: f64,
+}
+
+fn run_daemon_search_wave(
+    target: &DaemonTarget,
+    cwd: Option<&Path>,
+    query: &str,
+    limit: usize,
+    filters: &SearchFilters,
+    concurrency: usize,
+) -> Result<Vec<DaemonBenchSample>> {
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let target = target.clone();
+        let cwd = cwd.map(Path::to_path_buf);
+        let query = query.to_string();
+        let filters = filters.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<DaemonBenchSample> {
+            barrier.wait();
+            let started = Instant::now();
+            let result = run_daemon_search_once(&target, cwd.as_deref(), &query, limit, &filters)?;
+            Ok(DaemonBenchSample {
+                result_count: daemon_search_result_count(&result),
+                elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+            })
+        }));
+    }
+
+    let mut samples = Vec::with_capacity(concurrency);
+    for handle in handles {
+        let sample = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("daemon benchmark worker panicked"))??;
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
+fn run_daemon_search_once(
+    target: &DaemonTarget,
+    cwd: Option<&Path>,
+    query: &str,
+    limit: usize,
+    filters: &SearchFilters,
+) -> Result<Value> {
+    let mut arguments =
+        daemon_search_auto_arguments(query, limit, filters, 0, false, false, false, true);
+    if let (Value::Object(arguments), Some(cwd)) = (&mut arguments, cwd) {
+        arguments.insert(
+            "cwd".to_string(),
+            Value::String(cwd.to_string_lossy().to_string()),
+        );
+    }
+    daemon_tool_request_target(target, "search_auto", arguments)
+}
+
+fn daemon_tool_request_target(
+    target: &DaemonTarget,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value> {
+    match target {
+        DaemonTarget::Tcp(addr) => {
+            daemon_tool_request_stream(TcpStream::connect(addr)?, tool, arguments)
+        }
+        #[cfg(unix)]
+        DaemonTarget::Unix(socket) => {
+            daemon_tool_request_stream(UnixStream::connect(socket)?, tool, arguments)
+        }
+    }
+}
+
+fn daemon_search_result_count(result: &Value) -> usize {
+    result
+        .get("summary")
+        .and_then(|summary| summary.get("result_count"))
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .or_else(|| {
+            result
+                .get("results")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+        })
+        .or_else(|| result.as_array().map(Vec::len))
+        .unwrap_or(0)
 }
 
 fn run_shard_search_once(
