@@ -211,9 +211,10 @@ different local root.
 `summary` with query count, total samples, max p95/p99, max sample, and the
 slowest query. Use `--fail-p95-ms` for hard gates and `--baseline` /
 `--write-baseline` for regression checks. `bench-shards` also reports
-`shard_route` so slow queries show their selected shard count. `bench-daemon`
-uses concurrent JSON-lines `search_auto` requests to measure shared-daemon
-queueing under local multi-agent load.
+`shard_route`, visible hit shards, and selected shards without visible hits, so
+slow queries show whether routing or ranking is wasting fanout. `bench-daemon` uses
+concurrent JSON-lines `search_auto` requests to measure shared-daemon queueing
+under local multi-agent load.
 
 ## Docs
 

@@ -6243,6 +6243,12 @@ fn cli_reports_search_benchmarks() {
         .stdout(predicate::str::contains("\"summary\""))
         .stdout(predicate::str::contains("\"shard_route\""))
         .stdout(predicate::str::contains("\"selected_shards\""))
+        .stdout(predicate::str::contains("\"visible_hit_shards\":1"))
+        .stdout(predicate::str::contains(
+            "\"selected_without_visible_hits\":0",
+        ))
+        .stdout(predicate::str::contains("\"selected_shard_ratio\":1.0"))
+        .stdout(predicate::str::contains("\"visible_hit_shard_ratio\":1.0"))
         .stdout(predicate::str::contains("\"p95_ms\""))
         .stdout(predicate::str::contains("\"p99_ms\""));
 

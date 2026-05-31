@@ -1616,6 +1616,14 @@ struct QueryBench {
     result_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shard_route: Option<ShardRouteStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visible_hit_shards: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_without_visible_hits: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_shard_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visible_hit_shard_ratio: Option<f64>,
     min_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
@@ -7618,7 +7626,7 @@ fn bench_search(config: BenchConfig) -> Result<BenchReport> {
             samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
             result_count = results.len();
         }
-        query_reports.push(summarize_query(query, result_count, samples_ms, None));
+        query_reports.push(summarize_query(query, result_count, samples_ms, None, None));
     }
 
     Ok(bench_report(
@@ -7652,6 +7660,7 @@ fn bench_shards(config: ShardBenchConfig) -> Result<BenchReport> {
 
         let mut samples_ms = Vec::with_capacity(runs);
         let mut result_count = 0usize;
+        let mut final_results = Vec::new();
         for _ in 0..runs {
             let started = Instant::now();
             let results = run_shard_search_once(
@@ -7663,17 +7672,16 @@ fn bench_shards(config: ShardBenchConfig) -> Result<BenchReport> {
             )?;
             samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
             result_count = results.len();
+            final_results = results;
         }
-        let shard_route = Some(shard_query_route_stats(
-            &config.index_dir,
-            query,
-            &config.filters,
-        )?);
+        let shard_route = shard_query_route_stats(&config.index_dir, query, &config.filters)?;
+        let diagnostics = shard_bench_diagnostics(&final_results, &shard_route);
         query_reports.push(summarize_query(
             query,
             result_count,
             samples_ms,
-            shard_route,
+            Some(shard_route),
+            Some(diagnostics),
         ));
     }
 
@@ -7726,7 +7734,7 @@ fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
                 result_count = sample.result_count;
             }
         }
-        query_reports.push(summarize_query(query, result_count, samples_ms, None));
+        query_reports.push(summarize_query(query, result_count, samples_ms, None, None));
     }
 
     Ok(bench_report(
@@ -7899,6 +7907,7 @@ fn summarize_query(
     result_count: usize,
     mut samples_ms: Vec<f64>,
     shard_route: Option<ShardRouteStats>,
+    shard_diagnostics: Option<ShardBenchDiagnostics>,
 ) -> QueryBench {
     samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let min_ms = *samples_ms.first().unwrap_or(&0.0);
@@ -7910,12 +7919,62 @@ fn summarize_query(
         query: query.to_string(),
         result_count,
         shard_route,
+        visible_hit_shards: shard_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.visible_hit_shards),
+        selected_without_visible_hits: shard_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.selected_without_visible_hits),
+        selected_shard_ratio: shard_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.selected_shard_ratio),
+        visible_hit_shard_ratio: shard_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.visible_hit_shard_ratio),
         min_ms: round_ms(min_ms),
         p50_ms: round_ms(p50_ms),
         p95_ms: round_ms(p95_ms),
         p99_ms: round_ms(p99_ms),
         max_ms: round_ms(max_ms),
         samples_ms: samples_ms.into_iter().map(round_ms).collect(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ShardBenchDiagnostics {
+    visible_hit_shards: usize,
+    selected_without_visible_hits: usize,
+    selected_shard_ratio: f64,
+    visible_hit_shard_ratio: f64,
+}
+
+fn shard_bench_diagnostics(
+    results: &[orient::repo_index::SearchResult],
+    shard_route: &ShardRouteStats,
+) -> ShardBenchDiagnostics {
+    let visible_hit_shards = results
+        .iter()
+        .filter_map(|result| result.path.split_once('/').map(|(shard, _)| shard))
+        .collect::<HashSet<_>>()
+        .len();
+    let selected_without_visible_hits = shard_route
+        .selected_shards
+        .saturating_sub(visible_hit_shards);
+    let selected_shard_ratio = if shard_route.total_shards == 0 {
+        0.0
+    } else {
+        shard_route.selected_shards as f64 / shard_route.total_shards as f64
+    };
+    let visible_hit_shard_ratio = if shard_route.selected_shards == 0 {
+        0.0
+    } else {
+        visible_hit_shards as f64 / shard_route.selected_shards as f64
+    };
+    ShardBenchDiagnostics {
+        visible_hit_shards,
+        selected_without_visible_hits,
+        selected_shard_ratio: round_ratio(selected_shard_ratio),
+        visible_hit_shard_ratio: round_ratio(visible_hit_shard_ratio),
     }
 }
 
@@ -7956,6 +8015,10 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
 }
 
 fn round_ms(value: f64) -> f64 {
+    (value * 1_000.0).round() / 1_000.0
+}
+
+fn round_ratio(value: f64) -> f64 {
     (value * 1_000.0).round() / 1_000.0
 }
 
