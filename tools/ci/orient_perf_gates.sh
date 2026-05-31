@@ -327,6 +327,7 @@ target/release/orient bench-daemon-churn \
   --churn-files 2 \
   --limit 10 \
   --request-timeout-ms 30000 \
+  --max-wall-ms 120000 \
   --fail-p95-ms 1000 \
   --fail-p99-ms 1000 \
   --fail-fallback-rate 0 \

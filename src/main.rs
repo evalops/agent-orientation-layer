@@ -1068,6 +1068,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value_t = DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS)]
         request_timeout_ms: u64,
+        #[arg(long)]
+        max_wall_ms: Option<u64>,
         #[arg(long = "repo-filter")]
         repo_filter: Option<String>,
         #[command(flatten)]
@@ -6125,6 +6127,7 @@ fn run() -> Result<()> {
             warmup,
             limit,
             request_timeout_ms,
+            max_wall_ms,
             repo_filter,
             filters,
             query_args,
@@ -6148,6 +6151,7 @@ fn run() -> Result<()> {
                 warmup,
                 limit,
                 request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
+                max_wall_time: max_wall_ms.map(|ms| Duration::from_millis(ms.max(1))),
                 filters,
                 operations,
                 churn_dir,
@@ -8207,6 +8211,7 @@ struct DaemonChurnBenchConfig {
     warmup: usize,
     limit: usize,
     request_timeout: Duration,
+    max_wall_time: Option<Duration>,
     filters: SearchFilters,
     operations: Vec<DaemonMixOperation>,
     churn_dir: PathBuf,
@@ -8542,6 +8547,7 @@ fn bench_daemon_mix(config: DaemonMixBenchConfig) -> Result<BenchReport> {
 }
 
 fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
+    let started = Instant::now();
     let runs = config.runs.max(1);
     let concurrency = config.concurrency.max(1);
     let churn_files = config.churn_files.max(1);
@@ -8554,6 +8560,10 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
         );
     }
     let churn_dir = resolve_churn_dir(&config.cwd, &config.churn_dir)?;
+    let mut cleanup_guard = ChurnCleanupGuard::new(config.cleanup, churn_dir.clone(), churn_files);
+    let deadline = config
+        .max_wall_time
+        .and_then(|max_wall_time| started.checked_add(max_wall_time));
     let mut samples_by_operation = BTreeMap::<String, BenchQueryAccumulator>::new();
     let search_flags = DaemonSearchFlags {
         refresh_if_stale: true,
@@ -8573,7 +8583,7 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
                 &config.filters,
                 search_flags,
                 concurrency,
-                config.request_timeout,
+                churn_wave_request_timeout(config.request_timeout, deadline)?,
             )?;
             accumulate_daemon_mix_wave(&mut baseline_samples, wave);
         }
@@ -8596,7 +8606,7 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
             &config.filters,
             search_flags,
             concurrency,
-            config.request_timeout,
+            churn_wave_request_timeout(config.request_timeout, deadline)?,
         )?;
     }
 
@@ -8612,13 +8622,14 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
             &config.filters,
             search_flags,
             concurrency,
-            config.request_timeout,
+            churn_wave_request_timeout(config.request_timeout, deadline)?,
         )?;
         accumulate_daemon_mix_wave(&mut samples_by_operation, wave);
     }
 
     if config.cleanup {
         cleanup_churn_files(&churn_dir, churn_files)?;
+        cleanup_guard.disarm();
     }
 
     let query_reports = samples_by_operation
@@ -8634,10 +8645,25 @@ fn bench_daemon_churn(config: DaemonChurnBenchConfig) -> Result<BenchReport> {
         query_reports,
     );
     report.summary.churn_writes = Some(churn_writes);
+    report.summary.wall_ms = Some(round_ms(started.elapsed().as_secs_f64() * 1_000.0));
     report.summary.baseline_max_p95_ms = baseline_max_p95_ms;
     report.summary.refresh_overhead_max_p95_ms = baseline_max_p95_ms
         .map(|baseline| round_ms((report.summary.max_p95_ms - baseline).max(0.0)));
     Ok(report)
+}
+
+fn churn_wave_request_timeout(
+    request_timeout: Duration,
+    deadline: Option<Instant>,
+) -> Result<Duration> {
+    let Some(deadline) = deadline else {
+        return Ok(request_timeout);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("daemon churn benchmark exceeded --max-wall-ms before starting next wave");
+    }
+    Ok(std::cmp::min(request_timeout, remaining))
 }
 
 fn bench_daemon_contend(config: DaemonContentionBenchConfig) -> Result<BenchReport> {
@@ -9152,6 +9178,34 @@ fn cleanup_churn_files(churn_dir: &Path, churn_files: usize) -> Result<()> {
     }
     let _ = fs::remove_dir(churn_dir);
     Ok(())
+}
+
+struct ChurnCleanupGuard {
+    enabled: bool,
+    churn_dir: PathBuf,
+    churn_files: usize,
+}
+
+impl ChurnCleanupGuard {
+    fn new(enabled: bool, churn_dir: PathBuf, churn_files: usize) -> Self {
+        Self {
+            enabled,
+            churn_dir,
+            churn_files,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.enabled = false;
+    }
+}
+
+impl Drop for ChurnCleanupGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = cleanup_churn_files(&self.churn_dir, self.churn_files);
+        }
+    }
 }
 
 fn churn_file_name(file_index: usize) -> String {
@@ -9851,5 +9905,42 @@ mod tests {
                 .unwrap(),
             status
         );
+    }
+
+    #[test]
+    fn churn_wave_request_timeout_clamps_to_remaining_wall_time() {
+        let request_timeout = Duration::from_secs(30);
+        assert_eq!(
+            churn_wave_request_timeout(request_timeout, None).unwrap(),
+            request_timeout
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let clamped = churn_wave_request_timeout(request_timeout, Some(deadline)).unwrap();
+        assert!(clamped <= Duration::from_millis(25), "{clamped:?}");
+        assert!(!clamped.is_zero(), "{clamped:?}");
+
+        let expired = churn_wave_request_timeout(
+            request_timeout,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(expired.contains("--max-wall-ms"), "{expired}");
+    }
+
+    #[test]
+    fn churn_cleanup_guard_removes_marker_files_on_error_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let churn_dir = temp.path().join(".orient-churn-bench");
+        write_churn_files(&churn_dir, 7, 2).unwrap();
+
+        {
+            let _guard = ChurnCleanupGuard::new(true, churn_dir.clone(), 2);
+        }
+
+        assert!(!churn_dir.join("orient_churn_0.rs").exists());
+        assert!(!churn_dir.join("orient_churn_1.rs").exists());
+        assert!(!churn_dir.exists());
     }
 }

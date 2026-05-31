@@ -203,6 +203,7 @@ orient bench-daemon-churn \
   --warmup 2 \
   --baseline-runs 3 \
   --request-timeout-ms 30000 \
+  --max-wall-ms 120000 \
   --query orient_churn_token \
   --fail-fallback-rate 0.01
 ```
@@ -212,9 +213,11 @@ orient bench-daemon-churn \
 `refresh_if_stale:true` and `retry_if_empty:true`, and removes the marker files
 unless `--keep-churn-files` is set. Reports include `fallback_count`,
 `stale_count`, `primary_retry_count`, `refresh_request_count`, `fallback_rate`,
-`churn_writes`, `baseline_max_p95_ms`, and `refresh_overhead_max_p95_ms`.
-`fallback_rate` is measured over search samples. The baseline waves run before
-the edits so refresh cost is visible instead of being hidden inside one p95.
+`churn_writes`, `wall_ms`, `baseline_max_p95_ms`, and
+`refresh_overhead_max_p95_ms`. `fallback_rate` is measured over search samples.
+The baseline waves run before the edits so refresh cost is visible instead of
+being hidden inside one p95. Use `--max-wall-ms` to cap the whole churn run; the
+benchmark clamps each wave's request timeout to the remaining wall budget.
 
 Check shared-daemon contention with:
 

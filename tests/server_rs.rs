@@ -12769,6 +12769,8 @@ fn tcp_daemon_churn_bench_reports_refresh_metrics_without_fallback() {
             "1",
             "--request-timeout-ms",
             "5000",
+            "--max-wall-ms",
+            "30000",
             "--fail-fallback-rate",
             "0",
         ])
@@ -12791,6 +12793,7 @@ fn tcp_daemon_churn_bench_reports_refresh_metrics_without_fallback() {
     assert_eq!(report["summary"]["fallback_count"], serde_json::json!(0));
     assert_eq!(report["summary"]["fallback_rate"], serde_json::json!(0.0));
     assert_eq!(report["summary"]["churn_writes"], serde_json::json!(3));
+    assert!(report["summary"]["wall_ms"].as_f64().unwrap() > 0.0);
     assert!(report["summary"]["baseline_max_p95_ms"].as_f64().unwrap() >= 0.0);
     assert!(
         report["summary"]["refresh_overhead_max_p95_ms"]
