@@ -29,7 +29,7 @@ pub const SHARD_MANIFEST_FORMAT_VERSION: u32 = 1;
 const SHARD_MANIFEST_VERSION: u32 = SHARD_MANIFEST_FORMAT_VERSION;
 const SHARD_MANIFEST_SIDECAR_VERSION: u32 = 2;
 const SHARD_MANIFEST_PREFILTER_VERSION: u32 = 3;
-const SHARD_MANIFEST_ROUTE_VERSION: u32 = 11;
+const SHARD_MANIFEST_ROUTE_VERSION: u32 = 12;
 const SHARD_MANIFEST_FILE: &str = "manifest.json";
 const SHARD_MANIFEST_SIDECAR_FILE: &str = "manifest.bin";
 const SHARD_MANIFEST_PREFILTER_FILE: &str = "manifest.prefilter.bin";
@@ -2406,6 +2406,7 @@ fn shard_query_sketch(index: &FastIndex) -> ShardQuerySketch {
         push_route_short_filter_hashes(&file.file_name_lower, &mut exact_hashes);
         push_content_identifier_hashes(&file.content, &mut exact_hashes);
         push_content_substring_grams(&file.content, &mut substring_bits);
+        push_normalized_content_identifier_substring_grams(&file.content, &mut substring_bits);
     }
     exact_hashes.sort_unstable();
     exact_hashes.dedup();
@@ -2580,6 +2581,30 @@ fn push_content_substring_grams(content: &str, substring_bits: &mut [u64]) {
     push_segment_substring_grams(&mut segment, substring_bits);
 }
 
+fn push_normalized_content_identifier_substring_grams(content: &str, substring_bits: &mut [u64]) {
+    let mut identifier = String::new();
+    for ch in content.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            identifier.push(ch);
+            continue;
+        }
+        push_normalized_identifier_substring_grams(&mut identifier, substring_bits);
+    }
+    push_normalized_identifier_substring_grams(&mut identifier, substring_bits);
+}
+
+fn push_normalized_identifier_substring_grams(identifier: &mut String, substring_bits: &mut [u64]) {
+    if identifier.chars().count() >= SHARD_ROUTE_SUBSTRING_GRAM_CHARS {
+        let normalized = normalize_token(identifier);
+        if normalized.chars().count() >= SHARD_ROUTE_SUBSTRING_GRAM_CHARS {
+            for gram in shard_query_substring_grams(&normalized) {
+                sketch_insert(substring_bits, &gram);
+            }
+        }
+    }
+    identifier.clear();
+}
+
 fn push_segment_substring_grams(segment: &mut String, substring_bits: &mut [u64]) {
     if segment.chars().count() >= SHARD_ROUTE_SUBSTRING_GRAM_CHARS {
         for gram in shard_query_substring_grams(segment) {
@@ -2690,6 +2715,9 @@ fn route_filter_substring_grams(filters: &SearchFilters) -> Vec<String> {
         })
     {
         grams.extend(shard_query_substring_grams(&route_substring_value(value)));
+    }
+    if let Some(symbol) = &filters.symbol {
+        grams.extend(shard_query_substring_grams(&normalize_token(symbol)));
     }
     grams.sort();
     grams.dedup();
@@ -4092,6 +4120,12 @@ mod tests {
         bits
     }
 
+    fn normalized_identifier_substring_bits_for(value: &str) -> Vec<u64> {
+        let mut bits = vec![0; SHARD_SUBSTRING_SKETCH_WORDS];
+        push_normalized_content_identifier_substring_grams(value, &mut bits);
+        bits
+    }
+
     #[test]
     fn ascii_case_insensitive_contains_matches_without_lowercase_inputs() {
         assert!(contains_ascii_case_insensitive(
@@ -4842,6 +4876,56 @@ mod tests {
         assert_eq!(
             shard_route_candidate_ids(&route, &substring_route_requirements("trigramprobe")),
             ShardRouteLookup::Candidates(vec![0])
+        );
+    }
+
+    #[test]
+    fn manifest_route_uses_normalized_symbol_substrings_for_symbol_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_hash = sketch_fingerprint("token");
+        let session_hash = sketch_fingerprint("session");
+        let manager_hash = sketch_fingerprint("manager");
+        let broad_hashes = vec![token_hash, session_hash, manager_hash];
+        let mut manifest = test_manifest(&dir.path().join("hit"), Some(&dir.path().join("split")));
+        manifest.shards.push(ShardEntry {
+            name: "plain".to_string(),
+            root: dir.path().join("plain"),
+            index: "plain.orient".to_string(),
+            aliases: Vec::new(),
+            git: None,
+            sketch: None,
+        });
+        for shard in &mut manifest.shards {
+            shard.sketch = Some(ShardQuerySketch {
+                exact_hashes: broad_hashes.clone(),
+                trigram_hashes: Vec::new(),
+                exact_bits: Vec::new(),
+                trigram_bits: Vec::new(),
+                substring_bits: Vec::new(),
+                symbol_kind_bits: Vec::new(),
+                filter_bits: Vec::new(),
+            });
+        }
+        manifest.shards[0].sketch.as_mut().unwrap().substring_bits =
+            normalized_identifier_substring_bits_for("pub struct SessionManager;");
+        manifest.shards[1].sketch.as_mut().unwrap().substring_bits =
+            substring_bits_for("session manager token");
+        save_manifest(dir.path(), &manifest).unwrap();
+
+        let stats = shard_query_route_stats(
+            dir.path(),
+            "symbol:SessionManager token",
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats,
+            ShardRouteStats {
+                status: "routed".to_string(),
+                routed: true,
+                total_shards: 3,
+                selected_shards: 1,
+            }
         );
     }
 
