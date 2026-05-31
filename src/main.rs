@@ -966,6 +966,40 @@ enum Commands {
         #[arg(required_unless_present = "query_args", allow_hyphen_values = true)]
         queries: Vec<String>,
     },
+    BenchDaemonRead {
+        #[arg(long, help = "Unix daemon socket; falls back to ORIENT_SOCKET")]
+        socket: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "TCP daemon address; falls back to ORIENT_ADDR or 127.0.0.1:8796"
+        )]
+        addr: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 10)]
+        runs: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        #[arg(long, default_value_t = DEFAULT_DAEMON_BENCH_REQUEST_TIMEOUT_MS)]
+        request_timeout_ms: u64,
+        #[arg(long = "range", value_name = "PATH:START:LINES[:SCOPE]")]
+        range_args: Vec<CliRangeSpec>,
+        #[arg(
+            required_unless_present = "range_args",
+            value_name = "PATH:START:LINES[:SCOPE]"
+        )]
+        ranges: Vec<CliRangeSpec>,
+        #[arg(long)]
+        fail_p95_ms: Option<f64>,
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.25)]
+        max_p95_regression: f64,
+    },
     ToolManifest {
         #[arg(long = "format", default_value = "json", value_parser = ["json"])]
         format: String,
@@ -5796,6 +5830,42 @@ fn run() -> Result<()> {
                 fail_slow_bench_queries(&report, threshold)?;
             }
         }
+        Commands::BenchDaemonRead {
+            socket,
+            addr,
+            cwd,
+            concurrency,
+            runs,
+            warmup,
+            request_timeout_ms,
+            range_args,
+            ranges,
+            fail_p95_ms,
+            baseline,
+            write_baseline,
+            max_p95_regression,
+        } => {
+            let ranges = cli_benchmark_ranges(range_args, ranges)?;
+            let report = bench_daemon_read(DaemonReadBenchConfig {
+                target: resolve_daemon_target(socket, addr),
+                cwd,
+                concurrency,
+                runs,
+                warmup,
+                request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
+                ranges,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            if let Some(path) = write_baseline {
+                write_bench_baseline(&path, &report)?;
+            }
+            if let Some(path) = baseline {
+                compare_bench_baseline(&path, &report, max_p95_regression, false, false)?;
+            }
+            if let Some(threshold) = fail_p95_ms {
+                fail_slow_bench_queries(&report, threshold)?;
+            }
+        }
         Commands::ToolManifest { format: _format } => {
             println!("{}", serde_json::to_string(&tool_manifest())?);
         }
@@ -7457,6 +7527,61 @@ fn cli_benchmark_queries(query_args: Vec<String>, queries: Vec<String>) -> Resul
     cli_batch_queries(queries)
 }
 
+fn cli_benchmark_ranges(
+    range_args: Vec<CliRangeSpec>,
+    ranges: Vec<CliRangeSpec>,
+) -> Result<Vec<CliRangeSpec>> {
+    let ranges = range_args.into_iter().chain(ranges).collect::<Vec<_>>();
+    if ranges.is_empty() {
+        bail!("provide at least one range or --range PATH:START:LINES");
+    }
+    if ranges.len() > MAX_BATCH_RANGES {
+        bail!(
+            "ranges has {} items, max {}",
+            ranges.len(),
+            MAX_BATCH_RANGES
+        );
+    }
+    for range in &ranges {
+        validate_cli_range_spec(range)?;
+    }
+    Ok(ranges)
+}
+
+fn cli_range_label(range: &CliRangeSpec) -> String {
+    match range.scope {
+        Some(scope) => format!(
+            "{}:{}:{}:{}",
+            range.path,
+            range.start,
+            range.lines,
+            range_scope_label(scope)
+        ),
+        None => format!("{}:{}:{}", range.path, range.start, range.lines),
+    }
+}
+
+fn cli_range_value(range: &CliRangeSpec) -> Value {
+    let mut value = Map::new();
+    value.insert("path".to_string(), Value::String(range.path.clone()));
+    value.insert("start".to_string(), serde_json::json!(range.start));
+    value.insert("lines".to_string(), serde_json::json!(range.lines));
+    if let Some(scope) = range.scope {
+        value.insert(
+            "scope".to_string(),
+            Value::String(range_scope_label(scope).to_string()),
+        );
+    }
+    Value::Object(value)
+}
+
+fn range_scope_label(scope: RangeScope) -> &'static str {
+    match scope {
+        RangeScope::Exact => "exact",
+        RangeScope::Symbol => "symbol",
+    }
+}
+
 fn shard_bootstrap_output<T: Serialize>(
     stats: T,
     discovery: Vec<DiscoverySelectionSummary>,
@@ -7580,6 +7705,16 @@ struct DaemonBenchConfig {
     request_timeout: Duration,
     filters: SearchFilters,
     queries: Vec<String>,
+}
+
+struct DaemonReadBenchConfig {
+    target: DaemonTarget,
+    cwd: Option<PathBuf>,
+    concurrency: usize,
+    runs: usize,
+    warmup: usize,
+    request_timeout: Duration,
+    ranges: Vec<CliRangeSpec>,
 }
 
 fn bench_search(config: BenchConfig) -> Result<BenchReport> {
@@ -7747,6 +7882,56 @@ fn bench_daemon(config: DaemonBenchConfig) -> Result<BenchReport> {
     ))
 }
 
+fn bench_daemon_read(config: DaemonReadBenchConfig) -> Result<BenchReport> {
+    let runs = config.runs.max(1);
+    let concurrency = config.concurrency.max(1);
+    let mut query_reports = Vec::new();
+
+    for range in &config.ranges {
+        for _ in 0..config.warmup {
+            let _ = run_daemon_read_wave(
+                &config.target,
+                config.cwd.as_deref(),
+                range,
+                concurrency,
+                config.request_timeout,
+            )?;
+        }
+
+        let mut samples_ms = Vec::with_capacity(runs * concurrency);
+        let mut result_count = 0usize;
+        for _ in 0..runs {
+            let wave = run_daemon_read_wave(
+                &config.target,
+                config.cwd.as_deref(),
+                range,
+                concurrency,
+                config.request_timeout,
+            )?;
+            for sample in wave {
+                samples_ms.push(sample.elapsed_ms);
+                result_count = sample.result_count;
+            }
+        }
+        query_reports.push(summarize_query(
+            &cli_range_label(range),
+            result_count,
+            samples_ms,
+            None,
+            None,
+        ));
+    }
+
+    Ok(bench_report(
+        "daemon_read_range".to_string(),
+        runs,
+        config.warmup,
+        1,
+        Some(concurrency),
+        query_reports,
+    ))
+}
+
 fn bench_report(
     mode: String,
     runs: usize,
@@ -7816,6 +8001,41 @@ fn run_daemon_search_wave(
     Ok(samples)
 }
 
+fn run_daemon_read_wave(
+    target: &DaemonTarget,
+    cwd: Option<&Path>,
+    range: &CliRangeSpec,
+    concurrency: usize,
+    request_timeout: Duration,
+) -> Result<Vec<DaemonBenchSample>> {
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let target = target.clone();
+        let cwd = cwd.map(Path::to_path_buf);
+        let range = range.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<DaemonBenchSample> {
+            barrier.wait();
+            let started = Instant::now();
+            let result = run_daemon_read_once(&target, cwd.as_deref(), &range, request_timeout)?;
+            Ok(DaemonBenchSample {
+                result_count: daemon_read_line_count(&result),
+                elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+            })
+        }));
+    }
+
+    let mut samples = Vec::with_capacity(concurrency);
+    for handle in handles {
+        let sample = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("daemon read benchmark worker panicked"))??;
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
 fn run_daemon_search_once(
     target: &DaemonTarget,
     cwd: Option<&Path>,
@@ -7833,6 +8053,28 @@ fn run_daemon_search_once(
         );
     }
     daemon_tool_request_target(target, "search_auto", arguments, request_timeout)
+}
+
+fn run_daemon_read_once(
+    target: &DaemonTarget,
+    cwd: Option<&Path>,
+    range: &CliRangeSpec,
+    request_timeout: Duration,
+) -> Result<Value> {
+    let mut arguments = Map::new();
+    arguments.insert("range".to_string(), cli_range_value(range));
+    if let Some(cwd) = cwd {
+        arguments.insert(
+            "cwd".to_string(),
+            Value::String(cwd.to_string_lossy().to_string()),
+        );
+    }
+    daemon_tool_request_target(
+        target,
+        "read_range",
+        Value::Object(arguments),
+        request_timeout,
+    )
 }
 
 fn daemon_tool_request_target(
@@ -7872,6 +8114,15 @@ fn daemon_search_result_count(result: &Value) -> usize {
         })
         .or_else(|| result.as_array().map(Vec::len))
         .unwrap_or(0)
+}
+
+fn daemon_read_line_count(result: &Value) -> usize {
+    result
+        .get("summary")
+        .and_then(|summary| summary.get("line_count"))
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or_else(|| usize::from(result.get("text").and_then(Value::as_str).is_some()))
 }
 
 fn run_shard_search_once(

@@ -1,6 +1,6 @@
 # Benchmarking
 
-Orient has three benchmark layers:
+Orient has four benchmark layers:
 
 - `tools/ci/orient_perf_gates.sh` is the small CI gate. It keeps release builds,
   unit-level search behavior, JSON-lines smoke coverage, and latency regressions
@@ -11,6 +11,8 @@ Orient has three benchmark layers:
 - `orient bench-daemon` is the shared-daemon concurrency benchmark. It sends
   simultaneous JSON-lines `search_auto` requests to one daemon so a local
   multi-agent setup can check queueing and tail latency.
+- `orient bench-daemon-read` checks the follow-up path after search by sending
+  concurrent bounded `read_range` requests to the daemon.
 - `tools/ci/orient_daemon_cwd_perf.sh` is the local shared-daemon benchmark. It
   warms shards, scopes requests through a checkout `cwd`, and gates repeated
   concurrent `search_auto` latency for the path coding agents normally use.
@@ -65,6 +67,23 @@ hanging the caller. For warmed multi-shard daemons, compare the startup
 count can turn broad fanout queries into cache churn. Also check
 `max_concurrent_shard_workers`; this is the daemon-wide fanout budget shared by
 concurrent requests and defaults to `max_shard_workers`, the per-query cap.
+
+Check the bounded context-read path with:
+
+```bash
+orient bench-daemon-read \
+  --addr 127.0.0.1:8796 \
+  --cwd /path/to/current/repo \
+  --concurrency 10 \
+  --runs 10 \
+  --warmup 2 \
+  --request-timeout-ms 30000 \
+  --range src/main.rs:1:40 \
+  --range README.md:1:40
+```
+
+For `bench-daemon-read`, each reported query is a range label and
+`result_count` is the line count returned by `read_range`.
 
 The default query set intentionally mixes:
 
