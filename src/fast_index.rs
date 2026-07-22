@@ -33,7 +33,7 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -248,6 +248,66 @@ struct RefreshCandidate {
 }
 
 impl FastIndex {
+    /// Cryptographically fence every source snapshot stored in this index to
+    /// the corresponding blob in an exact Git tree.
+    pub fn content_matches_git_tree(&self, tree: &str) -> Result<bool> {
+        let mut child = process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["cat-file", "--batch"])
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::null())
+            .spawn()
+            .with_context(|| format!("open Git object reader in {}", self.root.display()))?;
+        let mut stdin = child.stdin.take().context("open Git object reader input")?;
+        let mut stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("open Git object reader output")?,
+        );
+        let result = (|| -> Result<bool> {
+            for file in &self.files {
+                if file.path.contains(['\n', '\r']) {
+                    return Ok(false);
+                }
+                writeln!(stdin, "{tree}:{}", file.path)?;
+                stdin.flush()?;
+                let mut header = String::new();
+                stdout.read_line(&mut header)?;
+                if header.ends_with(" missing\n") {
+                    return Ok(false);
+                }
+                let size = header
+                    .split_ascii_whitespace()
+                    .nth(2)
+                    .context("Git object reader returned an invalid header")?
+                    .parse::<usize>()?;
+                if size > MAX_FILE_BYTES as usize {
+                    return Ok(false);
+                }
+                let mut bytes = vec![0u8; size];
+                stdout.read_exact(&mut bytes)?;
+                let mut terminator = [0u8; 1];
+                stdout.read_exact(&mut terminator)?;
+                if terminator != [b'\n'] || bytes != file.content.as_bytes() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        drop(stdin);
+        if !matches!(result, Ok(true)) {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        if matches!(result, Ok(true)) && !status.success() {
+            anyhow::bail!("Git object reader failed for {}", self.root.display());
+        }
+        result
+    }
+
     pub fn build(root: impl AsRef<Path>) -> Result<Self> {
         Ok(Self::refresh(root, None)?.index)
     }

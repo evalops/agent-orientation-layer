@@ -131,6 +131,19 @@ Orient. JSON-emitting setup and discovery commands such as `discover-repos`,
 `refresh-shards`, `ensure-shards`, `shard-status`, `tool-manifest`,
 `mcp-manifest`, and `agent-guide` accept the same explicit `--format json`
 contract.
+
+`warmth_plan` accepts `repo` plus optional `index_dir`, `query`, `max_paths`,
+`max_bytes`, `required_revision`, and `heat`. It returns a versioned exact-Git
+plan containing the validated shard file inventory and an ordered, bounded
+workspace prefetch list. `heat` is an array of `{ "path": "...", "count": N }`
+objects. Unsafe paths and links are rejected from the plan; a required revision
+mismatch fails the request. The CLI equivalent is `orient warmth-plan`.
+When `index_dir` is present, reusable warmth accepts exactly one clean,
+current repository shard; multi-repository or stale shard directories are
+rejected so their source snapshots cannot cross repository scope.
+Warmth results are acceleration hints: consumers independently enforce trust,
+archive safety, content digests, and live-read authority.
+
 The CLI equivalent for automatic target selection is `orient search-auto`. When
 no target flag is supplied, it first tries the shared TCP daemon at
 `127.0.0.1:8796`, infers the current git checkout as `repo_filter` when

@@ -28,6 +28,68 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+#[test]
+fn runtime_serves_warmth_plan_and_manifest_contract() {
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join("src/lib.rs"), "pub fn warm_agent() {}\n");
+    write(
+        &repo.path().join("Cargo.toml"),
+        "[package]\nname='warm'\nversion='0.1.0'\n",
+    );
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+
+    let runtime = ToolRuntime::default();
+    let response = runtime.dispatch(ToolRequest {
+        id: serde_json::json!("warmth"),
+        tool: "warmth_plan".into(),
+        arguments: serde_json::json!({
+            "repo": repo.path(),
+            "query": "warm_agent",
+            "max_paths": 4,
+            "max_bytes": 4096
+        }),
+    });
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["plan_version"], 1);
+    assert!(
+        result["prefetch"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/lib.rs")
+    );
+
+    let manifest = tool_manifest();
+    let warmth = manifest
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "warmth_plan")
+        .expect("warmth_plan tool");
+    assert_eq!(warmth["required"], serde_json::json!(["repo"]));
+    assert_eq!(
+        warmth["input_schema"]["properties"]["max_paths"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        warmth["input_schema"]["properties"]["max_bytes"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        warmth["input_schema"]["properties"]["heat"]["type"],
+        "array"
+    );
+    assert_eq!(
+        warmth["input_schema"]["properties"]["heat"]["items"]["properties"]["count"]["type"],
+        "integer"
+    );
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")

@@ -32,6 +32,11 @@ use crate::shards::{
     shard_sketch_may_diagnose_query, shard_sketch_may_match_query, shard_status,
     shard_status_by_root,
 };
+use crate::warmth::{
+    MAX_WARMTH_CANDIDATES, MAX_WARMTH_HEAT_BYTES, MAX_WARMTH_PATH_BYTES, MAX_WARMTH_PLAN_BYTES,
+    MAX_WARMTH_PLAN_PATHS, RepositoryWarmthPlanRequest, WarmthHeatObservation,
+    build_repository_warmth_plan,
+};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -1762,6 +1767,19 @@ pub fn tool_manifest() -> Value {
             &["detail"],
         ),
         tool_entry(
+            "warmth_plan",
+            "Return a revision-fenced, budgeted Orient shard inventory and ordered workspace prefetch plan.",
+            &["repo"],
+            &[
+                "index_dir",
+                "query",
+                "max_paths",
+                "max_bytes",
+                "required_revision",
+                "heat",
+            ],
+        ),
+        tool_entry(
             "repo_map",
             "Return entrypoints, tests, top symbols, known commands, and important files for a live repo, persistent index, or shard directory.",
             &[],
@@ -2617,6 +2635,47 @@ fn input_schema(tool_name: &str, required: &[&str], optional: &[&str]) -> Value 
 
 fn argument_schema(tool_name: &str, name: &str) -> Value {
     let mut schema = Map::new();
+    if tool_name == "warmth_plan" {
+        match name {
+            "max_paths" => {
+                schema.insert("type".to_string(), json!("integer"));
+                schema.insert("minimum".to_string(), json!(1));
+                schema.insert("maximum".to_string(), json!(MAX_WARMTH_PLAN_PATHS));
+            }
+            "max_bytes" => {
+                schema.insert("type".to_string(), json!("integer"));
+                schema.insert("minimum".to_string(), json!(1));
+                schema.insert("maximum".to_string(), json!(MAX_WARMTH_PLAN_BYTES));
+            }
+            "heat" => {
+                schema.insert("type".to_string(), json!("array"));
+                schema.insert("maxItems".to_string(), json!(MAX_WARMTH_CANDIDATES));
+                schema.insert(
+                    "items".to_string(),
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["path", "count"],
+                        "properties": {
+                            "path": {"type": "string", "maxLength": MAX_WARMTH_PATH_BYTES},
+                            "count": {"type": "integer", "minimum": 0}
+                        }
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    if !schema.is_empty() {
+        schema.insert(
+            "description".to_string(),
+            json!(argument_description(tool_name, name)),
+        );
+        if let Some(default) = argument_default(tool_name, name) {
+            schema.insert("default".to_string(), default);
+        }
+        return Value::Object(schema);
+    }
     match name {
         name if string_list_argument(name) => {
             schema.insert(
@@ -4410,6 +4469,45 @@ impl ToolRuntime {
                 let detail = repo_map_detail_arg(&request.arguments)?;
                 let index = RepoIndexer::new(repo).build()?;
                 Ok(serde_json::to_value(index.repo_brief_with_detail(detail))?)
+            }
+            "warmth_plan" => {
+                let repo = path_arg(&request.arguments, "repo")?;
+                let index_dir =
+                    optional_string_arg(&request.arguments, "index_dir").map(PathBuf::from);
+                let query = optional_string_arg(&request.arguments, "query").unwrap_or_default();
+                let max_paths = positive_usize_arg(&request.arguments, "max_paths", 64)?;
+                let max_bytes = match argument_value(&request.arguments, "max_bytes") {
+                    Some(value) => value
+                        .as_u64()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| anyhow!("max_bytes must be a positive integer"))?,
+                    None => 16 * 1024 * 1024,
+                };
+                let heat = match argument_value(&request.arguments, "heat") {
+                    Some(value) => {
+                        anyhow::ensure!(
+                            serde_json::to_vec(value)?.len() as u64 <= MAX_WARMTH_HEAT_BYTES,
+                            "warmth heat exceeds {MAX_WARMTH_HEAT_BYTES} bytes"
+                        );
+                        serde_json::from_value::<Vec<WarmthHeatObservation>>(value.clone())
+                            .context("parse warmth heat")?
+                    }
+                    None => Vec::new(),
+                };
+                Ok(serde_json::to_value(build_repository_warmth_plan(
+                    RepositoryWarmthPlanRequest {
+                        repo,
+                        index_dir,
+                        query,
+                        required_revision: optional_string_arg(
+                            &request.arguments,
+                            "required_revision",
+                        ),
+                        max_paths,
+                        max_bytes,
+                        heat,
+                    },
+                )?)?)
             }
             "repo_map" => {
                 let symbol_limit = positive_usize_arg(&request.arguments, "symbols", 50)?;

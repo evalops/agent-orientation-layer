@@ -45,6 +45,242 @@ impl SessionManager {
 }
 
 #[test]
+fn cli_outputs_bounded_revision_fenced_warmth_plan() {
+    let repo = sample_repo();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    let revision = ProcessCommand::new("git")
+        .args(["-C", repo.path().to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let revision = String::from_utf8(revision.stdout).unwrap();
+    let shards = repo.path().join("shards");
+
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--output-dir",
+            shards.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.to_str().unwrap(),
+            "--query",
+            "SessionManager token",
+            "--max-paths",
+            "2",
+            "--max-bytes",
+            "4096",
+            "--required-revision",
+            revision.trim(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["plan_version"], 1);
+    assert_eq!(plan["source_revision"], revision.trim());
+    assert!(plan["prefetch"].as_array().unwrap().len() <= 2);
+    assert!(
+        plan["prefetch"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/auth.rs")
+    );
+    assert!(
+        plan["shard_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "manifest.json")
+    );
+}
+
+#[test]
+fn warmth_plan_rejects_dirty_or_stale_repository_shards() {
+    let repo = sample_repo();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    let shards = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    write(&repo.path().join("secret.txt"), "untracked\n");
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("clean"));
+    fs::remove_file(repo.path().join("secret.txt")).unwrap();
+
+    write(&repo.path().join("src/auth.rs"), "pub fn dirty() {}\n");
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("clean"));
+
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "changed"]);
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale"));
+}
+
+#[test]
+fn warmth_plan_rejects_multi_repository_shard_directories() {
+    let first = sample_repo();
+    let second = sample_repo();
+    for repo in [&first, &second] {
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "orient@example.com"]);
+        git(repo.path(), &["config", "user.name", "Orient Tests"]);
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "fixture"]);
+    }
+    let shards = tempfile::tempdir().unwrap();
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            first.path().to_str().unwrap(),
+            "--repo",
+            second.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            first.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("single-repository"));
+}
+
+#[test]
+fn warmth_plan_rejects_shard_snapshot_with_spoofed_size_and_mtime() {
+    let repo = sample_repo();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    let source = repo.path().join("src/auth.rs");
+    let mut poisoned = fs::read(&source).unwrap();
+    poisoned[1] = if poisoned[1] == b'x' { b'y' } else { b'x' };
+    fs::write(&source, poisoned).unwrap();
+    let timestamp = tempfile::NamedTempFile::new().unwrap();
+    let status = ProcessCommand::new("touch")
+        .args([
+            "-r",
+            source.to_str().unwrap(),
+            timestamp.path().to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let shards = tempfile::tempdir().unwrap();
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    git(repo.path(), &["checkout", "--", "src/auth.rs"]);
+    let status = ProcessCommand::new("touch")
+        .args([
+            "-r",
+            timestamp.path().to_str().unwrap(),
+            source.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exact Git tree"));
+}
+
+#[test]
 fn cli_outputs_repo_brief_as_json() {
     let repo = sample_repo();
 

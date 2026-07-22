@@ -104,6 +104,33 @@ in a local cache and out of source control.
 orient shard-status --index-dir "$ORIENT_SHARDS" --summary
 ```
 
+## Warmth Plans
+
+Orient can turn task intent into a deterministic, revision-fenced working set
+for Orb or another cache manager. The plan includes the validated files needed
+to reopen a shard and an ordered list of repository paths worth prefetching.
+
+```bash
+orient warmth-plan \
+  --repo /path/to/current/repo \
+  --index-dir "$ORIENT_SHARDS" \
+  --query "fix session token refresh" \
+  --max-paths 64 \
+  --max-bytes 16777216 \
+  --required-revision "$(git -C /path/to/current/repo rev-parse HEAD)"
+```
+
+Use `--heat observations.json` to add bounded historical path counts. Direct
+search hits, related files, repo-map entrypoints/manifests/tests, and heat are
+deduplicated before budget admission. Orient never uploads or archives these
+files; it emits JSON for a trust-aware transport such as Orb to verify and use.
+The equivalent JSON-lines tool is `warmth_plan`.
+Reusable shard export requires a clean checkout and a single-repository shard
+directory. Stale indexes, dirty or untracked files, and shared multi-repository
+manifests fail closed instead of entering a revision-fenced capsule.
+Every indexed source snapshot is also compared byte-for-byte with its blob in
+the exact Git tree, so spoofed timestamps cannot relabel stale shard content.
+
 ## Benchmarks
 
 For local performance work, start with the 10-client shared-daemon contention
