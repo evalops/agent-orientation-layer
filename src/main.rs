@@ -1,5 +1,5 @@
 use ahash::AHashSet as HashSet;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use orient::discover::{
     DiscoverOptions, DiscoverySelectionSummary, discover_repos, discovery_selection_summary,
@@ -30,6 +30,9 @@ use orient::shards::{
     read_shard_range_scoped, refresh_shards, related_shard_files_filtered,
     related_shard_symbols_filtered, search_shards, shard_query_plans, shard_query_route_stats,
     shard_repo_maps, shard_status,
+};
+use orient::warmth::{
+    RepositoryWarmthPlanRequest, WarmthHeatObservation, build_repository_warmth_plan,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -213,6 +216,24 @@ enum Commands {
         nested_manifests: bool,
         #[arg(long)]
         output_dir: PathBuf,
+    },
+    WarmthPlan {
+        #[arg(long = "format", default_value = "json", value_parser = ["json"])]
+        format: String,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        index_dir: Option<PathBuf>,
+        #[arg(long, default_value = "")]
+        query: String,
+        #[arg(long, default_value_t = 64)]
+        max_paths: usize,
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        max_bytes: u64,
+        #[arg(long)]
+        required_revision: Option<String>,
+        #[arg(long)]
+        heat: Option<PathBuf>,
     },
     SearchShards {
         #[arg(long)]
@@ -3938,6 +3959,36 @@ fn run() -> Result<()> {
                 "{}",
                 serde_json::to_string(&shard_bootstrap_output(stats, selection.discovery)?)?
             );
+        }
+        Commands::WarmthPlan {
+            format: _format,
+            repo,
+            index_dir,
+            query,
+            max_paths,
+            max_bytes,
+            required_revision,
+            heat,
+        } => {
+            let heat = heat
+                .map(|path| -> Result<Vec<WarmthHeatObservation>> {
+                    let bytes = fs::read(&path)
+                        .with_context(|| format!("read warmth heat {}", path.display()))?;
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| format!("parse warmth heat {}", path.display()))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let plan = build_repository_warmth_plan(RepositoryWarmthPlanRequest {
+                repo,
+                index_dir,
+                query,
+                required_revision,
+                max_paths,
+                max_bytes,
+                heat,
+            })?;
+            println!("{}", serde_json::to_string(&plan)?);
         }
         Commands::SearchShards {
             index_dir,

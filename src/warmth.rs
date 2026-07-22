@@ -1,7 +1,9 @@
 //! Deterministic, bounded working-set plans for portable agent warmth.
 
 use crate::fast_index::INDEX_FORMAT_VERSION;
+use crate::repo_index::{RepoIndexer, RepoMapDetail};
 use crate::shards::SHARD_MANIFEST_FORMAT_VERSION;
+use crate::shards::warmth_shard_files;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,6 +16,12 @@ pub const MAX_WARMTH_PLAN_PATHS: usize = 4096;
 pub const MAX_WARMTH_PLAN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_WARMTH_CANDIDATES: usize = 65_536;
 pub const MAX_WARMTH_SHARD_FILES: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmthHeatObservation {
+    pub path: String,
+    pub count: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +50,17 @@ pub struct WarmthPlanRequest {
     pub max_bytes: u64,
     pub shard_files: Vec<String>,
     pub candidates: Vec<WarmthCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryWarmthPlanRequest {
+    pub repo: PathBuf,
+    pub index_dir: Option<PathBuf>,
+    pub query: String,
+    pub required_revision: Option<String>,
+    pub max_paths: usize,
+    pub max_bytes: u64,
+    pub heat: Vec<WarmthHeatObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +225,75 @@ pub fn build_warmth_plan(request: WarmthPlanRequest) -> Result<WarmthPlan> {
         prefetch,
         total_prefetch_bytes,
         rejected_candidates,
+    })
+}
+
+pub fn build_repository_warmth_plan(request: RepositoryWarmthPlanRequest) -> Result<WarmthPlan> {
+    let index = RepoIndexer::new(&request.repo).build()?;
+    let candidate_limit = request.max_paths.saturating_mul(4).clamp(16, 256);
+    let mut candidates = Vec::new();
+    if !request.query.trim().is_empty() {
+        let results = index.search_code(&request.query, candidate_limit);
+        for (rank, result) in results.iter().enumerate() {
+            candidates.push(WarmthCandidate {
+                path: result.path.clone(),
+                reason: WarmthPlanReason::DirectSearch,
+                rank: rank as u32,
+                heat: 0,
+            });
+            for (related_rank, related) in
+                index.related_files(&result.path, 4).into_iter().enumerate()
+            {
+                candidates.push(WarmthCandidate {
+                    path: related.path,
+                    reason: WarmthPlanReason::Related,
+                    rank: (rank.saturating_mul(4).saturating_add(related_rank)) as u32,
+                    heat: 0,
+                });
+            }
+        }
+    }
+
+    let map = index.repo_map_with_detail(24, 24, RepoMapDetail::Compact);
+    let map_paths = map
+        .entrypoints
+        .into_iter()
+        .chain(map.test_files)
+        .chain(map.manifest_files)
+        .chain(map.important_files)
+        .chain(map.top_symbols.into_iter().map(|symbol| symbol.path))
+        .chain(map.related_files.into_iter().map(|file| file.path));
+    for (rank, path) in map_paths.enumerate() {
+        candidates.push(WarmthCandidate {
+            path,
+            reason: WarmthPlanReason::RepoMap,
+            rank: rank as u32,
+            heat: 0,
+        });
+    }
+    for (rank, observation) in request.heat.into_iter().enumerate() {
+        candidates.push(WarmthCandidate {
+            path: observation.path,
+            reason: WarmthPlanReason::Heat,
+            rank: rank as u32,
+            heat: observation.count,
+        });
+    }
+
+    let shard_files = request
+        .index_dir
+        .as_deref()
+        .map(warmth_shard_files)
+        .transpose()?
+        .unwrap_or_default();
+    build_warmth_plan(WarmthPlanRequest {
+        repo: request.repo,
+        query: request.query,
+        required_revision: request.required_revision,
+        max_paths: request.max_paths,
+        max_bytes: request.max_bytes,
+        shard_files,
+        candidates,
     })
 }
 

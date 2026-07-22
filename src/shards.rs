@@ -2902,6 +2902,42 @@ pub(crate) fn load_manifest(index_dir: &Path) -> Result<ShardManifest> {
     Ok(manifest)
 }
 
+/// Return the validated, bounded set of files needed to reopen a shard
+/// directory. Writer locks and unrelated directory contents are never included.
+pub fn warmth_shard_files(index_dir: impl AsRef<Path>) -> Result<Vec<String>> {
+    let index_dir = index_dir.as_ref();
+    let manifest = load_manifest(index_dir)?;
+    let mut files = vec![SHARD_MANIFEST_FILE.to_string()];
+    for sidecar in [
+        SHARD_MANIFEST_SIDECAR_FILE,
+        SHARD_MANIFEST_PREFILTER_FILE,
+        SHARD_MANIFEST_ROUTE_FILE,
+    ] {
+        if fs::symlink_metadata(index_dir.join(sidecar))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            files.push(sidecar.to_string());
+        }
+    }
+    for shard in manifest.shards {
+        let path = index_dir.join(&shard.index);
+        anyhow::ensure!(
+            fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()),
+            "shard index {} is missing or is not a regular file",
+            shard.index
+        );
+        files.push(shard.index);
+    }
+    files.sort();
+    files.dedup();
+    anyhow::ensure!(
+        files.len() <= crate::warmth::MAX_WARMTH_SHARD_FILES,
+        "warmth shard file count exceeds {}",
+        crate::warmth::MAX_WARMTH_SHARD_FILES
+    );
+    Ok(files)
+}
+
 pub(crate) fn shard_prefilter_query_impossible(
     index_dir: &Path,
     shard_query: &str,

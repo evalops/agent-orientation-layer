@@ -45,6 +45,77 @@ impl SessionManager {
 }
 
 #[test]
+fn cli_outputs_bounded_revision_fenced_warmth_plan() {
+    let repo = sample_repo();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    let revision = ProcessCommand::new("git")
+        .args(["-C", repo.path().to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let revision = String::from_utf8(revision.stdout).unwrap();
+    let shards = repo.path().join("shards");
+
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--output-dir",
+            shards.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.to_str().unwrap(),
+            "--query",
+            "SessionManager token",
+            "--max-paths",
+            "2",
+            "--max-bytes",
+            "4096",
+            "--required-revision",
+            revision.trim(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["plan_version"], 1);
+    assert_eq!(plan["source_revision"], revision.trim());
+    assert!(plan["prefetch"].as_array().unwrap().len() <= 2);
+    assert!(
+        plan["prefetch"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/auth.rs")
+    );
+    assert!(
+        plan["shard_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "manifest.json")
+    );
+}
+
+#[test]
 fn cli_outputs_repo_brief_as_json() {
     let repo = sample_repo();
 
