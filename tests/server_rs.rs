@@ -72,6 +72,22 @@ fn runtime_serves_warmth_plan_and_manifest_contract() {
         .find(|tool| tool["name"] == "warmth_plan")
         .expect("warmth_plan tool");
     assert_eq!(warmth["required"], serde_json::json!(["repo"]));
+    assert_eq!(
+        warmth["input_schema"]["properties"]["max_paths"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        warmth["input_schema"]["properties"]["max_bytes"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        warmth["input_schema"]["properties"]["heat"]["type"],
+        "array"
+    );
+    assert_eq!(
+        warmth["input_schema"]["properties"]["heat"]["items"]["properties"]["count"]["type"],
+        "integer"
+    );
 }
 
 fn git(repo: &Path, args: &[&str]) {

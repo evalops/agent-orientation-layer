@@ -116,6 +116,112 @@ fn cli_outputs_bounded_revision_fenced_warmth_plan() {
 }
 
 #[test]
+fn warmth_plan_rejects_dirty_or_stale_repository_shards() {
+    let repo = sample_repo();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    let shards = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    write(&repo.path().join("secret.txt"), "untracked\n");
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("clean"));
+    fs::remove_file(repo.path().join("secret.txt")).unwrap();
+
+    write(&repo.path().join("src/auth.rs"), "pub fn dirty() {}\n");
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("clean"));
+
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "changed"]);
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale"));
+}
+
+#[test]
+fn warmth_plan_rejects_multi_repository_shard_directories() {
+    let first = sample_repo();
+    let second = sample_repo();
+    for repo in [&first, &second] {
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "orient@example.com"]);
+        git(repo.path(), &["config", "user.name", "Orient Tests"]);
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "fixture"]);
+    }
+    let shards = tempfile::tempdir().unwrap();
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            first.path().to_str().unwrap(),
+            "--repo",
+            second.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            first.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("single-repository"));
+}
+
+#[test]
 fn cli_outputs_repo_brief_as_json() {
     let repo = sample_repo();
 

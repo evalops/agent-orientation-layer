@@ -2904,30 +2904,73 @@ pub(crate) fn load_manifest(index_dir: &Path) -> Result<ShardManifest> {
 
 /// Return the validated, bounded set of files needed to reopen a shard
 /// directory. Writer locks and unrelated directory contents are never included.
-pub fn warmth_shard_files(index_dir: impl AsRef<Path>) -> Result<Vec<String>> {
+pub fn warmth_shard_files_for_repo(
+    index_dir: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+) -> Result<Vec<String>> {
     let index_dir = index_dir.as_ref();
-    let manifest = load_manifest(index_dir)?;
-    let mut files = vec![SHARD_MANIFEST_FILE.to_string()];
-    for sidecar in [
-        SHARD_MANIFEST_SIDECAR_FILE,
-        SHARD_MANIFEST_PREFILTER_FILE,
-        SHARD_MANIFEST_ROUTE_FILE,
-    ] {
-        if fs::symlink_metadata(index_dir.join(sidecar))
-            .is_ok_and(|metadata| metadata.file_type().is_file())
-        {
-            files.push(sidecar.to_string());
-        }
-    }
-    for shard in manifest.shards {
-        let path = index_dir.join(&shard.index);
-        anyhow::ensure!(
-            fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()),
-            "shard index {} is missing or is not a regular file",
-            shard.index
-        );
-        files.push(shard.index);
-    }
+    let repository_root = repository_root.as_ref().canonicalize().with_context(|| {
+        format!(
+            "resolve warmth repository {}",
+            repository_root.as_ref().display()
+        )
+    })?;
+    let manifest_path = index_dir.join(SHARD_MANIFEST_FILE);
+    anyhow::ensure!(
+        fs::symlink_metadata(&manifest_path).is_ok_and(|metadata| metadata.file_type().is_file()),
+        "shard manifest is missing or is not a regular file"
+    );
+    let bytes = fs::read(&manifest_path)
+        .with_context(|| format!("read shard manifest {}", manifest_path.display()))?;
+    let manifest = serde_json::from_slice::<ShardManifest>(&bytes)?;
+    anyhow::ensure!(
+        manifest.version == SHARD_MANIFEST_VERSION,
+        "unsupported shard manifest version {}",
+        manifest.version
+    );
+    validate_manifest(&manifest)?;
+    anyhow::ensure!(
+        manifest.shards.len() == 1,
+        "reusable warmth requires a single-repository shard directory"
+    );
+    let matching = manifest
+        .shards
+        .into_iter()
+        .filter(|shard| canonical_or_self(&shard.root) == repository_root)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching.len() == 1,
+        "expected exactly one shard for repository {}, found {}",
+        repository_root.display(),
+        matching.len()
+    );
+    let shard = &matching[0];
+    let path = index_dir.join(&shard.index);
+    anyhow::ensure!(
+        fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()),
+        "shard index {} is missing or is not a regular file",
+        shard.index
+    );
+    let index = FastIndex::load(&path)?;
+    let freshness = index.freshness_at(&path)?;
+    anyhow::ensure!(
+        canonical_or_self(&freshness.root) == repository_root,
+        "shard index {} belongs to a different repository",
+        shard.index
+    );
+    let canonical_index_dir = index_dir
+        .canonicalize()
+        .with_context(|| format!("resolve shard directory {}", index_dir.display()))?;
+    let has_unrelated_additions = freshness
+        .added_paths
+        .iter()
+        .any(|path| !repository_root.join(path).starts_with(&canonical_index_dir));
+    anyhow::ensure!(
+        freshness.changed_files == 0 && freshness.deleted_files == 0 && !has_unrelated_additions,
+        "shard index {} is stale",
+        shard.index
+    );
+    let mut files = vec![SHARD_MANIFEST_FILE.to_string(), shard.index.clone()];
     files.sort();
     files.dedup();
     anyhow::ensure!(

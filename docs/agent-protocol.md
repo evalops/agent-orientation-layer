@@ -138,6 +138,9 @@ plan containing the validated shard file inventory and an ordered, bounded
 workspace prefetch list. `heat` is an array of `{ "path": "...", "count": N }`
 objects. Unsafe paths and links are rejected from the plan; a required revision
 mismatch fails the request. The CLI equivalent is `orient warmth-plan`.
+When `index_dir` is present, reusable warmth accepts exactly one clean,
+current repository shard; multi-repository or stale shard directories are
+rejected so their source snapshots cannot cross repository scope.
 Warmth results are acceleration hints: consumers independently enforce trust,
 archive safety, content digests, and live-read authority.
 

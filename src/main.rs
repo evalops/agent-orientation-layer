@@ -32,7 +32,8 @@ use orient::shards::{
     shard_repo_maps, shard_status,
 };
 use orient::warmth::{
-    RepositoryWarmthPlanRequest, WarmthHeatObservation, build_repository_warmth_plan,
+    MAX_WARMTH_HEAT_BYTES, RepositoryWarmthPlanRequest, WarmthHeatObservation,
+    build_repository_warmth_plan,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -3972,6 +3973,12 @@ fn run() -> Result<()> {
         } => {
             let heat = heat
                 .map(|path| -> Result<Vec<WarmthHeatObservation>> {
+                    let metadata = fs::symlink_metadata(&path)
+                        .with_context(|| format!("stat warmth heat {}", path.display()))?;
+                    anyhow::ensure!(
+                        metadata.file_type().is_file() && metadata.len() <= MAX_WARMTH_HEAT_BYTES,
+                        "warmth heat must be a regular file no larger than {MAX_WARMTH_HEAT_BYTES} bytes"
+                    );
                     let bytes = fs::read(&path)
                         .with_context(|| format!("read warmth heat {}", path.display()))?;
                     serde_json::from_slice(&bytes)

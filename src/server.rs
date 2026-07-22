@@ -33,7 +33,9 @@ use crate::shards::{
     shard_status_by_root,
 };
 use crate::warmth::{
-    RepositoryWarmthPlanRequest, WarmthHeatObservation, build_repository_warmth_plan,
+    MAX_WARMTH_CANDIDATES, MAX_WARMTH_HEAT_BYTES, MAX_WARMTH_PATH_BYTES, MAX_WARMTH_PLAN_BYTES,
+    MAX_WARMTH_PLAN_PATHS, RepositoryWarmthPlanRequest, WarmthHeatObservation,
+    build_repository_warmth_plan,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::{Context, Result, anyhow};
@@ -2633,6 +2635,47 @@ fn input_schema(tool_name: &str, required: &[&str], optional: &[&str]) -> Value 
 
 fn argument_schema(tool_name: &str, name: &str) -> Value {
     let mut schema = Map::new();
+    if tool_name == "warmth_plan" {
+        match name {
+            "max_paths" => {
+                schema.insert("type".to_string(), json!("integer"));
+                schema.insert("minimum".to_string(), json!(1));
+                schema.insert("maximum".to_string(), json!(MAX_WARMTH_PLAN_PATHS));
+            }
+            "max_bytes" => {
+                schema.insert("type".to_string(), json!("integer"));
+                schema.insert("minimum".to_string(), json!(1));
+                schema.insert("maximum".to_string(), json!(MAX_WARMTH_PLAN_BYTES));
+            }
+            "heat" => {
+                schema.insert("type".to_string(), json!("array"));
+                schema.insert("maxItems".to_string(), json!(MAX_WARMTH_CANDIDATES));
+                schema.insert(
+                    "items".to_string(),
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["path", "count"],
+                        "properties": {
+                            "path": {"type": "string", "maxLength": MAX_WARMTH_PATH_BYTES},
+                            "count": {"type": "integer", "minimum": 0}
+                        }
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    if !schema.is_empty() {
+        schema.insert(
+            "description".to_string(),
+            json!(argument_description(tool_name, name)),
+        );
+        if let Some(default) = argument_default(tool_name, name) {
+            schema.insert("default".to_string(), default);
+        }
+        return Value::Object(schema);
+    }
     match name {
         name if string_list_argument(name) => {
             schema.insert(
@@ -4442,6 +4485,10 @@ impl ToolRuntime {
                 };
                 let heat = match argument_value(&request.arguments, "heat") {
                     Some(value) => {
+                        anyhow::ensure!(
+                            serde_json::to_vec(value)?.len() as u64 <= MAX_WARMTH_HEAT_BYTES,
+                            "warmth heat exceeds {MAX_WARMTH_HEAT_BYTES} bytes"
+                        );
                         serde_json::from_value::<Vec<WarmthHeatObservation>>(value.clone())
                             .context("parse warmth heat")?
                     }

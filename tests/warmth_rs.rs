@@ -186,3 +186,55 @@ fn warmth_plan_v1_serialization_keeps_orb_consumer_fields() {
     }
     assert_eq!(value["prefetch"][0]["reasons"][0], "direct_search");
 }
+
+#[test]
+fn reason_specific_ranks_and_heat_counts_control_ordering() {
+    let repo = repository();
+    let plan = build_warmth_plan(WarmthPlanRequest {
+        repo: repo.path().to_path_buf(),
+        query: "direct".into(),
+        required_revision: None,
+        max_paths: 8,
+        max_bytes: 4096,
+        shard_files: Vec::new(),
+        candidates: vec![
+            candidate("src/related.rs", WarmthPlanReason::DirectSearch, 0),
+            candidate("src/direct.rs", WarmthPlanReason::DirectSearch, 1),
+            WarmthCandidate {
+                path: "src/direct.rs".into(),
+                reason: WarmthPlanReason::Heat,
+                rank: 0,
+                heat: 100,
+            },
+            WarmthCandidate {
+                path: "Cargo.toml".into(),
+                reason: WarmthPlanReason::Heat,
+                rank: 0,
+                heat: 1,
+            },
+            WarmthCandidate {
+                path: "docs/heat.md".into(),
+                reason: WarmthPlanReason::Heat,
+                rank: 1,
+                heat: 50,
+            },
+        ],
+    })
+    .unwrap();
+
+    let paths = plan
+        .prefetch
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            "src/related.rs",
+            "src/direct.rs",
+            "docs/heat.md",
+            "Cargo.toml"
+        ]
+    );
+    assert_eq!(plan.prefetch[1].best_rank, 1);
+}
