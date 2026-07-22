@@ -4,3 +4,4 @@ pub mod query;
 pub mod repo_index;
 pub mod server;
 pub mod shards;
+pub mod warmth;
