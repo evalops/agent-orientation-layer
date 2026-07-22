@@ -222,6 +222,65 @@ fn warmth_plan_rejects_multi_repository_shard_directories() {
 }
 
 #[test]
+fn warmth_plan_rejects_shard_snapshot_with_spoofed_size_and_mtime() {
+    let repo = sample_repo();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "orient@example.com"]);
+    git(repo.path(), &["config", "user.name", "Orient Tests"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    let source = repo.path().join("src/auth.rs");
+    let mut poisoned = fs::read(&source).unwrap();
+    poisoned[1] = if poisoned[1] == b'x' { b'y' } else { b'x' };
+    fs::write(&source, poisoned).unwrap();
+    let timestamp = tempfile::NamedTempFile::new().unwrap();
+    let status = ProcessCommand::new("touch")
+        .args([
+            "-r",
+            source.to_str().unwrap(),
+            timestamp.path().to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let shards = tempfile::tempdir().unwrap();
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "index-shards",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--output-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    git(repo.path(), &["checkout", "--", "src/auth.rs"]);
+    let status = ProcessCommand::new("touch")
+        .args([
+            "-r",
+            timestamp.path().to_str().unwrap(),
+            source.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    Command::cargo_bin("orient")
+        .unwrap()
+        .args([
+            "warmth-plan",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--index-dir",
+            shards.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exact Git tree"));
+}
+
+#[test]
 fn cli_outputs_repo_brief_as_json() {
     let repo = sample_repo();
 

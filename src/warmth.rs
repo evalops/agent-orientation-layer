@@ -312,7 +312,7 @@ pub fn build_repository_warmth_plan(request: RepositoryWarmthPlanRequest) -> Res
     let shard_files = request
         .index_dir
         .as_deref()
-        .map(|index_dir| warmth_shard_files_for_repo(index_dir, &repository_root))
+        .map(|index_dir| warmth_shard_files_for_repo(index_dir, &repository_root, &source_tree))
         .transpose()?
         .unwrap_or_default();
     ensure_git_clean(&repository_root, request.index_dir.as_deref())?;
@@ -442,6 +442,15 @@ fn git_identity(repo: &Path, revision: &str) -> Result<String> {
 }
 
 fn ensure_git_clean(repo: &Path, allowed_generated_dir: Option<&Path>) -> Result<()> {
+    let refresh = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["update-index", "-q", "--refresh"])
+        .status()
+        .with_context(|| format!("refresh Git index in {}", repo.display()))?;
+    if !refresh.success() {
+        bail!("repository must be clean before building reusable warmth");
+    }
     let tracked = Command::new("git")
         .arg("-C")
         .arg(repo)

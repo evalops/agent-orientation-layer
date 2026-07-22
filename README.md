@@ -128,6 +128,8 @@ The equivalent JSON-lines tool is `warmth_plan`.
 Reusable shard export requires a clean checkout and a single-repository shard
 directory. Stale indexes, dirty or untracked files, and shared multi-repository
 manifests fail closed instead of entering a revision-fenced capsule.
+Every indexed source snapshot is also compared byte-for-byte with its blob in
+the exact Git tree, so spoofed timestamps cannot relabel stale shard content.
 
 ## Benchmarks
 

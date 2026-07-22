@@ -2907,6 +2907,7 @@ pub(crate) fn load_manifest(index_dir: &Path) -> Result<ShardManifest> {
 pub fn warmth_shard_files_for_repo(
     index_dir: impl AsRef<Path>,
     repository_root: impl AsRef<Path>,
+    source_tree: &str,
 ) -> Result<Vec<String>> {
     let index_dir = index_dir.as_ref();
     let repository_root = repository_root.as_ref().canonicalize().with_context(|| {
@@ -2968,6 +2969,11 @@ pub fn warmth_shard_files_for_repo(
     anyhow::ensure!(
         freshness.changed_files == 0 && freshness.deleted_files == 0 && !has_unrelated_additions,
         "shard index {} is stale",
+        shard.index
+    );
+    anyhow::ensure!(
+        index.content_matches_git_tree(source_tree)?,
+        "shard index {} does not match the exact Git tree",
         shard.index
     );
     let mut files = vec![SHARD_MANIFEST_FILE.to_string(), shard.index.clone()];
