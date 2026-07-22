@@ -146,3 +146,43 @@ fn warmth_plan_rejects_zero_budgets() {
     .to_string();
     assert!(error.contains("budget"), "{error}");
 }
+
+#[test]
+fn warmth_plan_v1_serialization_keeps_orb_consumer_fields() {
+    let repo = repository();
+    let plan = build_warmth_plan(WarmthPlanRequest {
+        repo: repo.path().to_path_buf(),
+        query: "direct".into(),
+        required_revision: None,
+        max_paths: 8,
+        max_bytes: 4096,
+        shard_files: vec!["manifest.json".into(), "repo.orient".into()],
+        candidates: vec![candidate(
+            "src/direct.rs",
+            WarmthPlanReason::DirectSearch,
+            0,
+        )],
+    })
+    .unwrap();
+    let value = serde_json::to_value(plan).unwrap();
+    for field in [
+        "plan_version",
+        "repository_root",
+        "source_revision",
+        "source_tree",
+        "orient_version",
+        "index_format_version",
+        "shard_manifest_format_version",
+        "query",
+        "max_paths",
+        "max_bytes",
+        "shard_files",
+        "prefetch",
+        "total_prefetch_bytes",
+        "truncated",
+        "rejected_candidates",
+    ] {
+        assert!(value.get(field).is_some(), "missing {field}");
+    }
+    assert_eq!(value["prefetch"][0]["reasons"][0], "direct_search");
+}
